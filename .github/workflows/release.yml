@@ -63,8 +63,21 @@ jobs:
           echo "jar=$(ls extension/build/outputs/jar/release/*.jar)" >> "$GITHUB_OUTPUT"
           jarsigner -verify "$(ls extension/build/outputs/jar/release/*.jar)" | tail -1
 
+      # The release must exist before the index points at its download URLs.
+      - name: GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            ${{ steps.sig.outputs.apk }}
+            ${{ steps.sig.outputs.jar }}
+
       - name: Generate repository
         run: |
+          ARTIFACTS=""
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            ARTIFACTS="--artifact-base-url https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}"
+          fi
           python3 -I scripts/publish_repo.py \
             --metadata extension/build/outputs/extension-metadata.json \
             --apk "${{ steps.sig.outputs.apk }}" \
@@ -73,7 +86,7 @@ jobs:
             --base-url "https://raw.githubusercontent.com/${{ github.repository }}/repo" \
             --website "https://github.com/${{ github.repository }}" \
             --fingerprint "${{ steps.sig.outputs.fingerprint }}" \
-            --out repo-out
+            --out repo-out $ARTIFACTS
 
       - name: Publish to repo branch
         run: |
@@ -86,10 +99,3 @@ jobs:
           git commit -q -m "Publish ${GITHUB_REF_NAME} (${GITHUB_SHA::7})"
           git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" repo:repo
 
-      - name: GitHub release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            ${{ steps.sig.outputs.apk }}
-            ${{ steps.sig.outputs.jar }}

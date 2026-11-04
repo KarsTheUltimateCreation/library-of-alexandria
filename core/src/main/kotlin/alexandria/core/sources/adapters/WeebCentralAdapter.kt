@@ -22,7 +22,8 @@ class WeebCentralAdapter(ctx: AdapterContext) : HtmlAdapter(ctx) {
     override val name = "WeebCentral"
     override val baseUrl = "https://weebcentral.com"
     override val languages: Set<String> = setOf("en")
-    override val limiter: RateLimiter = RateLimiter.shared("weebcentral", 1, 2_000)
+    // Same long-run pace as the Keiyoushi extension (1 req / 2 s) but allows a burst of 3 when opening a series.
+    override val limiter: RateLimiter = RateLimiter.shared("weebcentral", 3, 6_000)
 
     override suspend fun search(query: String): List<SourceSeries> = searchData(query.replace(EXCLUDED_SEARCH_CHARS, " ").trim(), "Best Match")
 

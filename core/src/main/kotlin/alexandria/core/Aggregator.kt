@@ -37,6 +37,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
 import okhttp3.Headers.Companion.toHeaders
@@ -107,9 +108,25 @@ class Aggregator(
 
     // ---------------------------------------------------------------- search
 
-    suspend fun search(query: String, settings: AggregatorSettings): List<SeriesCard> = coroutineScope {
+    /** Recent search results; hosts re-run the same search when navigating back. */
+    private val searchCache = ConcurrentHashMap<String, Pair<Long, List<SeriesCard>>>()
+
+    suspend fun search(query: String, settings: AggregatorSettings): List<SeriesCard> {
+        val cacheKey = query.trim().lowercase() + "|" + settings.searchFingerprint()
+        searchCache[cacheKey]?.let { (at, cards) -> if (clock() - at < 10 * CacheManager.MINUTE) return cards }
+        return searchUncached(query, settings).also {
+            if (searchCache.size > 50) searchCache.clear()
+            searchCache[cacheKey] = clock() to it
+        }
+    }
+
+    private fun AggregatorSettings.searchFingerprint() =
+        listOf(mangabaka, anilist, metadataPreference, enabledSources.sorted(), languages, highQualityCovers).hashCode()
+
+    private suspend fun searchUncached(query: String, settings: AggregatorSettings): List<SeriesCard> = coroutineScope {
         val metaD = async { if (settings.mangabaka || settings.anilist) metadata.search(query, settings) else emptyList() }
-        val provD = async { searchProviders(listOf(query), settings) }
+        // Provider hits only pre-link entries; a slow provider must not hold up the results page.
+        val provD = async { searchProviders(listOf(query), settings, deadlineMs = SEARCH_DEADLINE_MS) }
         val metas = metaD.await().filter { it.kind == ContentKind.UNKNOWN || it.kind.isComic }
         val hits = provD.await()
 
@@ -178,20 +195,16 @@ class Aggregator(
         if (meta != null) state = resolveBindings(key, meta, state, settings)
         saveState(state)
 
-        // 3. Chapters.
-        var chapters: List<ChapterEntry>? = null
-        var report: CompletenessReport? = null
-        if (fetchChapters) {
-            val (entries, rep, canon) = buildChapters(key, state, settings)
-            chapters = entries
-            report = rep
-            canonical[key.value] = canon.associateBy { it.key }
+        // 3 + 4. Chapters and cover are independent: fetch them concurrently.
+        val finalState = state
+        val (built, cover) = coroutineScope {
+            val chaptersD = async { if (fetchChapters) buildChapters(key, finalState, settings) else null }
+            val coverD = async { if (fetchDetails) resolveCover(key, finalState, settings) else null }
+            chaptersD.await() to coverD.await()
         }
-
-        // 4. Cover + description.
-        val cover = if (fetchDetails) resolveCover(key, state, settings) else null
-        val details = buildDetails(state, cover, report, settings)
-        return SeriesUpdate(details, chapters, state, report)
+        built?.let { canonical[key.value] = it.canonical.associateBy { c -> c.key } }
+        val details = buildDetails(state, cover, built?.report, settings)
+        return SeriesUpdate(details, built?.entries, state, built?.report)
     }
 
     private data class Built(val entries: List<ChapterEntry>, val report: CompletenessReport?, val canonical: List<CanonicalChapter>)
@@ -304,9 +317,11 @@ class Aggregator(
         // Links pre-made from search results are title-only. Verify them with provider details (year,
         // tracker ids, alt titles) before trusting them, exactly like a normal match.
         val unverified = state.bindings.filter { (sid, b) -> !b.manual && !b.series.detailed && b.series.ids.isEmpty && registry[sid] != null }
-        for ((sid, b) in unverified) {
-            val adapter = registry[sid]!!
-            val detailed = guarded(adapter, settings) { adapter.details(b.series) } ?: continue
+        val verified = coroutineScope {
+            unverified.map { (sid, b) -> async { Triple(sid, b, guarded(registry[sid]!!, settings) { registry[sid]!!.details(b.series) }) } }.awaitAll()
+        }
+        for ((sid, b, detailed) in verified) {
+            if (detailed == null) continue
             val verdict = identity.match(meta, detailed)
             state = if (verdict.decision == MatchDecision.CONFIRMED) {
                 state.copy(bindings = state.bindings + (sid to b.copy(series = detailed, confidence = verdict.score)))
@@ -325,10 +340,11 @@ class Aggregator(
         if (toFind.isEmpty()) return state
 
         val queries = meta.searchQueries()
-        val results = searchProviders(queries, settings, toFind)
-        val found = mutableMapOf<String, Binding>()
-        val missed = mutableMapOf<String, Long>()
-        for (adapter in toFind) {
+        // Stop trying further title variants on a provider as soon as one query yields a confident match.
+        val results = searchProviders(queries, settings, toFind, stopWhen = { identity.pick(meta, it) != null })
+        val found = ConcurrentHashMap<String, Binding>()
+        val missed = ConcurrentHashMap<String, Long>()
+        coroutineScope { toFind.map { adapter -> async {
             val candidates = results[adapter.id].orEmpty()
             var pick = identity.pick(meta, candidates)
             if (pick == null || pick.first.ids.isEmpty) {
@@ -345,7 +361,7 @@ class Aggregator(
             } else if (results.containsKey(adapter.id)) {
                 missed[adapter.id] = now
             }
-        }
+        } }.awaitAll() }
         return state.copy(bindings = state.bindings + found, misses = state.misses + missed)
     }
 
@@ -353,19 +369,23 @@ class Aggregator(
         queries: List<String>,
         settings: AggregatorSettings,
         adapters: List<SourceAdapter> = registry.enabled(settings, includeUnhealthy = false),
+        deadlineMs: Long? = null,
+        stopWhen: (List<SourceSeries>) -> Boolean = { false },
     ): Map<String, List<SourceSeries>> = coroutineScope {
         val gate = Semaphore(settings.maxConcurrentSearches.coerceIn(1, 6))
         adapters.map { a ->
             async {
                 val collected = mutableListOf<SourceSeries>()
                 var anySuccess = false
-                for (q in queries.filter { it.isNotBlank() }) {
-                    val r = gate.withPermit { guarded(a, settings) { a.search(q) } } ?: continue
-                    anySuccess = true
-                    collected += r
-                    // Stop early once an exact title hit exists.
-                    if (r.any { TitleNormalizer.compact(it.title) == TitleNormalizer.compact(q) }) break
+                val work: suspend () -> Unit = {
+                    for (q in queries.filter { it.isNotBlank() }) {
+                        val r = gate.withPermit { guarded(a, settings) { a.search(q) } } ?: continue
+                        anySuccess = true
+                        collected += r
+                        if (stopWhen(collected) || r.any { TitleNormalizer.compact(it.title) == TitleNormalizer.compact(q) }) break
+                    }
                 }
+                if (deadlineMs != null) withTimeoutOrNull(deadlineMs) { work() } else work()
                 if (anySuccess) a.id to collected.distinctBy { it.id } else null
             }
         }.awaitAll().filterNotNull().toMap()
@@ -513,6 +533,10 @@ class Aggregator(
     fun forgetSeries(key: SeriesKey) {
         cache.remove("state:${key.value}")
         canonical.remove(key.value)
+    }
+
+    private companion object {
+        const val SEARCH_DEADLINE_MS = 6_000L
     }
 
     private fun keyFor(m: SeriesMetadata): SeriesKey? =

@@ -25,7 +25,10 @@ class MetadataResolver(
     suspend fun forKey(key: SeriesKey, settings: AggregatorSettings, providerHint: SourceSeries? = null): SeriesMetadata? = when (key) {
         is SeriesKey.MangaBaka -> {
             val mb = if (settings.mangabaka) cached("mb:${key.id}", settings) { mangaBaka.series(key.id) } else null
-            val al = if (settings.anilist) (mb?.ids?.anilist)?.let { id -> cached("al:$id", settings) { aniList.byId(id) } } else null
+            // AniList (30 req/min) only adds value when MangaBaka lacks a description/genres or is not preferred.
+            val needAniList = settings.anilist && (mb == null || mb.description.isNullOrBlank() || mb.genres.isEmpty() ||
+                settings.metadataPreference == MetadataPreference.ANILIST)
+            val al = if (needAniList) (mb?.ids?.anilist)?.let { id -> cached("al:$id", settings) { aniList.byId(id) } } else null
             merge(mb, al, settings) ?: providerHint?.asMetadata()
         }
         is SeriesKey.AniList -> {

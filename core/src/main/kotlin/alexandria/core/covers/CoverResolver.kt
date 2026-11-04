@@ -26,7 +26,7 @@ data class ScoredCover(val candidate: CoverCandidate, val score: Double, val ver
  */
 class CoverResolver(
     private val probe: suspend (CoverCandidate) -> ImageInfo?,
-    private val maxProbes: Int = 3,
+    private val maxProbes: Int = 2,
 ) {
 
     suspend fun rank(candidates: List<CoverCandidate>, settings: AggregatorSettings, originalLanguage: String?, primarySourceId: String?): List<ScoredCover> {
@@ -44,7 +44,7 @@ class CoverResolver(
             .sortedByDescending { it.coverOrigin.trust }
             .take(maxProbes)
         val probed: Map<String, ImageInfo?> = coroutineScope {
-            toProbe.map { c -> async { c.url to withTimeoutOrNull(8_000) { runCatching { probe(c) }.getOrNull() } } }.awaitAll().toMap()
+            toProbe.map { c -> async { c.url to withTimeoutOrNull(5_000) { runCatching { probe(c) }.getOrNull() } } }.awaitAll().toMap()
         }
 
         val scored = unique.map { c ->

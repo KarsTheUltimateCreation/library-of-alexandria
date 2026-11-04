@@ -182,6 +182,8 @@ def main() -> int:
     ap.add_argument("--jar")
     ap.add_argument("--icon", required=True)
     ap.add_argument("--base-url", required=True, help="public URL of the published repo directory, no trailing slash")
+    ap.add_argument("--artifact-base-url", help="where the APK/JAR are downloadable (e.g. a GitHub release download URL); "
+                    "defaults to <base-url>/apk and <base-url>/jar")
     ap.add_argument("--fingerprint", required=True, help="SHA-256 of the APK signing certificate (lowercase hex)")
     ap.add_argument("--website", default="https://github.com/")
     ap.add_argument("--name", default="Library of Alexandria")
@@ -210,6 +212,12 @@ def main() -> int:
     resources = {"apkUrl": f"{base}/apk/{apk_name}", "iconUrl": f"{base}/icon/{meta['pkg']}.png"}
     if jar_url:
         resources["jarUrl"] = jar_url
+    if a.artifact_base_url:
+        # Same hosting as keiyoushi: binaries served from GitHub Releases, index/icons from the repo branch.
+        art = a.artifact_base_url.rstrip("/")
+        resources["apkUrl"] = f"{art}/{apk_name}"
+        if jar_url:
+            resources["jarUrl"] = f"{art}/{Path(a.jar).name}"
     index = {
         "name": a.name,
         "badgeLabel": a.badge,

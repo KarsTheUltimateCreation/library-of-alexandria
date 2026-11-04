@@ -9,7 +9,7 @@ plugins {
 }
 
 /** Bump on every release. The full version is "<libVersion>.<extVersionCode>" (e.g. 1.6.1). */
-val extVersionCode = 1
+val extVersionCode = 2
 val libVersion = "1.6"
 val extName = "Library of Alexandria"
 val extLang = "all"

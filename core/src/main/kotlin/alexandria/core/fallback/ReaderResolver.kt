@@ -38,6 +38,10 @@ data class PageResolution(
 @Serializable
 private data class Choice(val sourceId: String, val chapterId: String)
 
+/** Provider ranking from the last full comparison in a series (best first). */
+@Serializable
+private data class SeriesPreference(val order: List<String>)
+
 /**
  * Chooses which provider serves a chapter and returns its page list.
  *
@@ -85,6 +89,23 @@ class ReaderResolver(
         }
 
         val compare = settings.qualityOptimization && settings.qualitySwitching && ordered.size > 1
+
+        // Fast path: a comparison earlier in this series already found the best provider. Use it directly
+        // and only compare again when it lacks this chapter or fails.
+        val seriesKey = chapterRef.substringBefore('|')
+        if (compare) {
+            cache.get("seriespref:$seriesKey:${settings.qualityMode}", SeriesPreference.serializer(), 3 * CacheManager.DAY)?.let { pref ->
+                val preferred = pref.order.firstNotNullOfOrNull { sid -> ordered.firstOrNull { it.sourceId == sid && it.confidence >= 0.8 } }
+                if (preferred != null) {
+                    fetchPages(preferred, settings)?.let { pages ->
+                        cache.put("choice:$chapterRef", Choice.serializer(), Choice(preferred.sourceId, preferred.chapterId))
+                        return remember(PageResolution(chapterRef, preferred, pages, ordered - preferred, listOf("series preference")))
+                    }
+                    attempts += preferred.sourceId to "preferred source failed"
+                }
+            }
+        }
+
         if (compare) {
             val k = when (settings.qualityMode) { QualityMode.BEST -> 3; QualityMode.BALANCED -> 2; QualityMode.DATA_SAVER -> 2 }
             // Low-confidence releases (possible numbering mismatch) never win on quality; they are fallback only.
@@ -102,6 +123,7 @@ class ReaderResolver(
                     evidence.filter { it.pages != null && it.release != best.release }.forEach { alternatePages[altKey(chapterRef, it.release)] = it.pages!! }
                     val rest = verdicts.drop(1).map { it.release } + (ordered - verdicts.map { it.release }.toSet())
                     cache.put("choice:$chapterRef", Choice.serializer(), Choice(best.release.sourceId, best.release.chapterId))
+                    cache.put("seriespref:$seriesKey:${settings.qualityMode}", SeriesPreference.serializer(), SeriesPreference(verdicts.map { it.release.sourceId }.distinct()))
                     return remember(PageResolution(chapterRef, best.release, pages, rest, notes))
                 }
                 // Every contender failed; continue sequentially with the remaining releases.
