@@ -47,8 +47,15 @@ object Settings {
     private const val META_PREF = "meta_preferred"
     private const val COMPLETENESS = "meta_completeness"
 
+    // Content
+    private const val ADULT = "content_adult"
+
     // Sources
     private const val ENABLED = "src_enabled"
+    /** Provider ids that existed when the user last saved [ENABLED]; providers added later start enabled. */
+    private const val KNOWN = "src_known"
+    /** Providers shipped before [KNOWN] was introduced (1.6.4). */
+    private val LEGACY_SOURCES = setOf("mangadex", "weebcentral", "mangapill", "mangakatana", "mangaread", "mgeko", "atsumaru")
     private const val ORDER = "src_order"
     private const val LINKS = "src_manual_links"
 
@@ -60,7 +67,7 @@ object Settings {
     private const val CACHE_ACTION = "perf_cache_action"
     private const val NONE = "__none__"
 
-    fun read(p: SharedPreferences): AggregatorSettings {
+    fun read(p: SharedPreferences, allSources: List<String>): AggregatorSettings {
         val d = AggregatorSettings()
         fun b(k: String, def: Boolean) = runCatching { p.getBoolean(k, def) }.getOrDefault(def)
         fun s(k: String, def: String) = runCatching { p.getString(k, def) }.getOrNull() ?: def
@@ -87,8 +94,8 @@ object Settings {
             mangabaka = b(MANGABAKA, d.mangabaka),
             metadataPreference = enumOr(s(META_PREF, "AUTO"), MetadataPreference.AUTO),
             completenessChecking = b(COMPLETENESS, d.completenessChecking),
-            // Never-configured = all providers; an explicitly emptied selection must mean none, not all.
-            enabledSources = runCatching { p.getStringSet(ENABLED, null) }.getOrNull()?.toSet()?.ifEmpty { setOf(NONE) } ?: emptySet(),
+            adultContent = b(ADULT, d.adultContent),
+            enabledSources = enabledSources(p, allSources),
             manualLinks = AggregatorSettings.parseManualLinks(s(LINKS, "")),
             maxConcurrentSearches = s(CONCURRENCY, "3").toIntOrNull()?.coerceIn(1, 6) ?: 3,
             requestTimeoutSeconds = s(TIMEOUT, "20").toIntOrNull()?.coerceIn(5, 120) ?: 20,
@@ -97,9 +104,19 @@ object Settings {
         )
     }
 
+    /**
+     * Never-configured = all providers; an explicitly emptied selection must mean none, not all. Providers added
+     * after the selection was saved are enabled, so a saved list from an older version does not hide them.
+     */
+    private fun enabledSources(p: SharedPreferences, allSources: List<String>): Set<String> {
+        val stored = runCatching { p.getStringSet(ENABLED, null) }.getOrNull()?.toSet() ?: return emptySet()
+        val known = runCatching { p.getStringSet(KNOWN, null) }.getOrNull()?.toSet() ?: LEGACY_SOURCES
+        return (stored + (allSources - known)).ifEmpty { setOf(NONE) }
+    }
+
     private inline fun <reified E : Enum<E>> enumOr(v: String, def: E): E = runCatching { enumValueOf<E>(v.uppercase()) }.getOrDefault(def)
 
-    fun build(screen: PreferenceScreen, p: SharedPreferences, sources: List<Pair<String, String>>, onAction: (Action) -> Unit) {
+    fun build(screen: PreferenceScreen, p: SharedPreferences, sources: List<Pair<String, String>>, adultSources: Set<String>, onAction: (Action) -> Unit) {
         val ctx = screen.context
 
         fun switch(key: String, title: String, summary: String, def: Boolean) = screen.addPreference(
@@ -173,15 +190,30 @@ object Settings {
         list(META_PREF, "Metadata · Preferred metadata provider", listOf("AUTO" to "Automatic", "MANGABAKA" to "MangaBaka", "ANILIST" to "AniList"), "AUTO")
         switch(COMPLETENESS, "Metadata · Chapter completeness checking", "Report gaps and untranslated chapters in the series description.", true)
 
+        // ---- Content
+        switch(
+            ADULT, "Content · Show 18+ content",
+            "Include pornographic titles (adult manhwa, hentai, doujinshi, erotica) in search, browse and filters, and use the " +
+                "adult providers: ${sources.filter { it.first in adultSources }.joinToString { it.second }}.",
+            false,
+        )
+
         // ---- Sources
         screen.addPreference(
             MultiSelectListPreference(ctx).apply {
                 key = ENABLED
                 title = "Sources · Enabled providers"
-                summary = "Disabled providers are never searched or used for fallback."
+                summary = "Disabled providers are never searched or used for fallback. Adult providers also need 18+ content enabled."
                 entries = sources.map { it.second }.toTypedArray()
                 entryValues = sources.map { it.first }.toTypedArray()
+                // Show providers added since the selection was saved as enabled, matching read().
+                val current = enabledSources(p, sources.map { it.first }).ifEmpty { sources.map { it.first }.toSet() }
                 setDefaultValue(sources.map { it.first }.toSet())
+                if (p.contains(ENABLED)) values = current
+                setOnPreferenceChangeListener { _, _ ->
+                    p.edit().putStringSet(KNOWN, sources.map { it.first }.toSet()).apply()
+                    true
+                }
             },
         )
         text(ORDER, "Sources · Provider order", "Comma-separated provider ids, most preferred first. Available: ${sources.joinToString { it.first }}", sources.joinToString(", ") { it.first })

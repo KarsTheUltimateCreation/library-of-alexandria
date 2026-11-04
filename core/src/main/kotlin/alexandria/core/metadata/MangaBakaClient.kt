@@ -35,14 +35,31 @@ class MangaBakaClient(private val client: OkHttpClient, private val json: Json, 
         return json.parseToJsonElement(client.fetchText(req, limiter = limiter)).jsonObject
     }
 
-    suspend fun search(query: String, limit: Int = 10, page: Int = 1, sortBy: String? = null): List<SeriesMetadata> {
+    /**
+     * Series search. [adult] false hides pornographic titles; [filters] narrow the result further (a content rating
+     * filter can only narrow, never widen, what [adult] allows).
+     */
+    suspend fun search(
+        query: String,
+        limit: Int = 10,
+        page: Int = 1,
+        sortBy: String? = null,
+        adult: Boolean = true,
+        filters: CatalogFilters = CatalogFilters(),
+    ): List<SeriesMetadata> {
+        val allowed = if (adult) CatalogFilters.ALL_RATINGS else CatalogFilters.NON_ADULT_RATINGS
+        val ratings = filters.contentRatings.filter { it in allowed }.ifEmpty { if (adult) emptyList() else allowed }
         val url = "$api/v1/series/search".toHttpUrl().newBuilder().apply {
             if (query.isNotBlank()) addQueryParameter("q", query)
             addQueryParameter("limit", limit.toString())
             addQueryParameter("page", page.toString())
-            sortBy?.let { addQueryParameter("sort_by", it) }
-            // Comics only; MangaBaka also catalogues novels.
-            listOf("manga", "manhwa", "manhua", "oel").forEach { addQueryParameter("type", it) }
+            (filters.sortBy ?: sortBy)?.let { addQueryParameter("sort_by", it) }
+            // Comics only unless a type filter says otherwise; MangaBaka also catalogues novels.
+            filters.types.ifEmpty { CatalogFilters.COMIC_TYPES }.forEach { addQueryParameter("type", it) }
+            filters.statuses.forEach { addQueryParameter("status", it) }
+            filters.genres.forEach { addQueryParameter("genre", it) }
+            filters.excludedGenres.forEach { addQueryParameter("genre_not", it) }
+            ratings.forEach { addQueryParameter("content_rating", it) }
         }.build().toString()
         val root = getJson(url, searchLimiter)
         return root["data"]?.jsonArray?.mapNotNull { runCatching { parseSeries(it.jsonObject) }.getOrNull() }

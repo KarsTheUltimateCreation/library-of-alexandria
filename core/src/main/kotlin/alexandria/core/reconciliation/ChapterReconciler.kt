@@ -68,11 +68,12 @@ class ChapterReconciler {
 
     fun reconcile(bySource: Map<String, List<SourceChapter>>, settings: AggregatorSettings): ReconcileResult {
         val parsed = bySource.mapValues { (_, list) ->
-            list.map { c ->
+            val raw = list.map { c ->
                 val p = ChapterLabelParser.parse(c.label, c.number, c.volume)
                 val lang = (p.languageHint ?: c.language).lowercase()
                 Parsed(c.copy(title = c.title ?: p.title), p, lang)
             }
+            if (seasonIsDecorative(raw)) raw.map { it.copy(label = it.label.copy(identity = it.label.identity.copy(season = null))) } else raw
         }
 
         val volumeReset = parsed.filter { (_, list) -> restartsPerVolume(list) }.keys
@@ -153,6 +154,26 @@ class ChapterReconciler {
             numberingOffsets = offsets,
             inputCount = bySource.values.sumOf { it.size },
         )
+    }
+
+    /**
+     * True when a provider's seasons do not restart the numbering, so the season adds nothing to the chapter's
+     * identity: "S1 Chapter 25" followed by "S2 Chapter 26", or every chapter labelled season 1. Such chapters must
+     * merge with other providers' plain "Chapter 25" instead of being listed twice.
+     */
+    private fun seasonIsDecorative(list: List<Parsed>): Boolean {
+        val mains = list.filter { it.label.identity.kind == ChapterKind.MAIN && it.label.identity.number != null }
+        val seasoned = mains.filter { it.label.identity.season != null }
+        if (seasoned.isEmpty()) return false
+        // The same number under two seasons (or under a season and none) means numbering restarts: keep seasons.
+        val seasonsPerNumber = mains.groupBy { it.label.identity.copy(season = null, volume = null, text = null).key() }
+            .values.map { group -> group.map { it.label.identity.season }.distinct().size }
+        if (seasonsPerNumber.any { it > 1 }) return false
+        val bySeason = seasoned.groupBy { it.label.identity.season!! }.toSortedMap()
+        if (bySeason.size == 1) return bySeason.firstKey() == 1
+        // Seasons must follow each other in number order: every season starts after the previous one ends.
+        val ranges = bySeason.values.map { g -> g.minOf { it.label.identity.number!! } to g.maxOf { it.label.identity.number!! } }
+        return ranges.zipWithNext().all { (a, b) -> b.first > a.second }
     }
 
     /** A provider restarts numbering per volume when the same main number repeats under different volumes. */

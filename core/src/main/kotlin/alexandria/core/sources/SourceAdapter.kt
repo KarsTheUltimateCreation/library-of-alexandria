@@ -27,6 +27,16 @@ interface SourceAdapter {
     /** Languages this provider serves, or null when it is multilingual and filters server-side. */
     val languages: Set<String>?
 
+    /** Adult (18+) provider: only searched or used when the user enabled 18+ content. */
+    val adult: Boolean get() = false
+
+    /**
+     * Image hosts (suffix match) whose requests need [imageHeaders]. Used to add the right Referer to cover
+     * requests the host app makes with the source's default headers. Hosts seen in this provider's cover URLs
+     * are learned automatically; list CDNs here so library covers load before anything was searched.
+     */
+    val imageHosts: Set<String> get() = emptySet()
+
     suspend fun search(query: String): List<SourceSeries>
 
     /** Fills alt titles / ids / status for a search hit. Default: unchanged. */

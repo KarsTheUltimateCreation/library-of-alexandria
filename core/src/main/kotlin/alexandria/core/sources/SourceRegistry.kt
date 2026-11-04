@@ -9,6 +9,11 @@ import alexandria.core.sources.adapters.MangaPillAdapter
 import alexandria.core.sources.adapters.MangaReadAdapter
 import alexandria.core.sources.adapters.MgekoAdapter
 import alexandria.core.sources.adapters.WeebCentralAdapter
+import alexandria.core.sources.adapters.HiperdexAdapter
+import alexandria.core.sources.adapters.ManhwaReadAdapter
+import alexandria.core.sources.adapters.OmegaScansAdapter
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * The bundled providers, their capabilities and current health. Adding a provider = implement
@@ -25,13 +30,32 @@ class SourceRegistry(private val adapters: List<SourceAdapter>, val health: Prov
 
     operator fun get(id: String): SourceAdapter? = adapters.firstOrNull { it.id == id }
 
+    /** Image host -> provider id, learned from cover URLs and seeded from [SourceAdapter.imageHosts]. */
+    private val imageHostOwners = ConcurrentHashMap<String, String>().apply {
+        adapters.forEach { a -> a.imageHosts.forEach { h -> putIfAbsent(h.lowercase(), a.id) } }
+    }
+
+    /** Remembers which provider serves images from [url]'s host so cover requests get its headers. */
+    fun noteImage(url: String?, sourceId: String) {
+        val host = url?.toHttpUrlOrNull()?.host?.lowercase() ?: return
+        if (imageHostOwners.size < 500) imageHostOwners.putIfAbsent(host, sourceId)
+    }
+
+    /** The provider whose images live on [host] (exact host first, then a listed parent domain). */
+    fun imageOwner(host: String): SourceAdapter? {
+        val h = host.lowercase()
+        imageHostOwners[h]?.let { return get(it) }
+        return imageHostOwners.entries.firstOrNull { (k, _) -> h.endsWith(".$k") }?.let { get(it.value) }
+    }
+
     /**
      * Enabled adapters in user order. Disabled providers never participate in search or fallback.
-     * An empty enabled set in settings means "all".
+     * An empty enabled set in settings means "all". Adult providers need 18+ content to be enabled.
      */
     fun enabled(settings: AggregatorSettings, includeUnhealthy: Boolean = true): List<SourceAdapter> =
         adapters
             .filter { settings.enabledSources.isEmpty() || it.id in settings.enabledSources }
+            .filter { !it.adult || settings.adultContent }
             .filter { a -> a.languages == null || settings.languages.isEmpty() || a.languages!!.any { settings.acceptsLanguage(it) } }
             .filter { includeUnhealthy || !health.isCircuitOpen(it.id) }
             .sortedBy { settings.sourceRank(it.id) * 1000 + adapters.indexOf(it) }
@@ -41,7 +65,9 @@ class SourceRegistry(private val adapters: List<SourceAdapter>, val health: Prov
 
         fun defaults(ctx: AdapterContext, health: ProviderHealth) = SourceRegistry(
             listOf(MangaDexAdapter(ctx), WeebCentralAdapter(ctx), MangaPillAdapter(ctx), MangaKatanaAdapter(ctx), MangaReadAdapter(ctx),
-                MgekoAdapter(ctx), AtsumaruAdapter(ctx)),
+                MgekoAdapter(ctx), AtsumaruAdapter(ctx),
+                // Adult (18+) providers: used only when 18+ content is enabled.
+                HiperdexAdapter(ctx), OmegaScansAdapter(ctx), ManhwaReadAdapter(ctx)),
             health,
         )
     }

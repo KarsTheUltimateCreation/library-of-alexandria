@@ -145,6 +145,11 @@ class MangaDexAdapter(private val ctx: AdapterContext) : SourceAdapter {
     }
 
     override fun seriesWebUrl(seriesId: String) = "$baseUrl/title/$seriesId"
+
+    /** uploads.mangadex.org answers browser user agents with an HTML page instead of the cover image. */
+    override val imageHosts = setOf("uploads.mangadex.org")
+
+    override fun imageHeaders(imageUrl: String): Map<String, String> = mapOf("User-Agent" to ctx.appUserAgent)
     override fun chapterWebUrl(chapter: SourceChapter) = "$baseUrl/chapter/${chapter.id}"
 
     private fun MdManga.toSeries(): SourceSeries {

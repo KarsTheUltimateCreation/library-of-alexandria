@@ -72,11 +72,14 @@ object ChapterLabelParser {
         val flags = mutableSetOf<LabelFlag>()
         var languageHint: String? = null
         val tagKinds = mutableListOf<ChapterKind>()
+        // Where the chapter title starts ("Chapter 568: <title>"): tags inside the title, such as
+        // "Ep. 568 (Spin-off #4)", describe the story, not the chapter kind.
+        val titleStart = CHAPTER.find(lower)?.let { c -> SEPARATOR.find(lower, c.range.last + 1)?.range?.first } ?: Int.MAX_VALUE
         val withoutTagsOriginal = TAG.replace(nfkc) { m ->
             val inner = m.groupValues[1].trim().lowercase()
             LANGUAGES[inner]?.let { languageHint = it }
             FLAG_WORDS.forEach { (re, flag) -> if (re.containsMatchIn(inner)) flags += flag }
-            KIND_WORDS.forEach { (re, kind) -> if (re.containsMatchIn(inner)) tagKinds += kind }
+            if (m.range.first < titleStart) KIND_WORDS.forEach { (re, kind) -> if (re.containsMatchIn(inner)) tagKinds += kind }
             val partInTag = PART_FRACTION.find(m.value)
             when {
                 partInTag != null -> m.value // keep "(1/2)" for part detection
@@ -100,7 +103,11 @@ object ChapterLabelParser {
             numberEnd = it.range.last + 1
         }
         if (season == null) {
-            SEASON.find(withoutTags)?.let { season = it.groupValues[1].toInt() }
+            // A season prefixes the chapter number ("Season 2 Chapter 10", "S2 Ep 10"). Mentions after it are part of
+            // the title or a note ("Chapter 25: Refining (4) - Season 1 End", "Chapter 26 (S2 Start)").
+            val chapterAt = CHAPTER.find(withoutTags)?.range?.first
+            val seasonScope = if (chapterAt != null) withoutTags.substring(0, chapterAt) else SEPARATOR.split(withoutTags, 2).first()
+            SEASON.find(seasonScope)?.let { season = it.groupValues[1].toInt() }
                 ?: ARC_PART.find(withoutTags)?.let { season = it.groupValues[1].toInt() }
         }
 
@@ -153,6 +160,12 @@ object ChapterLabelParser {
         val hasChapterKeyword = CHAPTER.containsMatchIn(head) || SEASON_EPISODE.containsMatchIn(head)
         if (kind == ChapterKind.SPECIAL && hasChapterKeyword) kind = null
         if (kind == ChapterKind.NOTICE && hasChapterKeyword && number != null) kind = null
+        // "Chapter 1 Prologue - 0th Regression": a numbered chapter that *is* the prologue, not a separate one.
+        if ((kind == ChapterKind.PROLOGUE || kind == ChapterKind.EPILOGUE) && tagKinds.isEmpty() && number != null &&
+            CHAPTER.find(head)?.let { c -> KIND_WORDS.first { it.second == kind }.first.find(head)?.let { k -> c.range.first < k.range.first } } == true
+        ) {
+            kind = null
+        }
 
         // 6. Part numbers ("Chapter 10 Part 1", "Chapter 10 (1/2)"). An arc "Part 2 Chapter 10" was consumed as season.
         val part = PART_FRACTION.find(withoutTags)?.groupValues?.get(1)?.toInt()

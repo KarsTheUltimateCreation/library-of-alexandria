@@ -42,8 +42,13 @@ Requires an app supporting extension lib **1.6** (Mihon 0.21+, Tachimanga 4.16+)
 
 English only. Bundled providers: **MangaDex** (API, English chapters only), **WeebCentral**, **MangaPill**,
 **MangaKatana**, **MangaRead**, **mgeko** (mostly manhwa/manhua) and **Atsumaru** (API, several
-scanlation groups per chapter).
+scanlation groups per chapter). With **18+ content** enabled: **Hiperdex**, **Omega Scans** and **ManhwaRead**
+(adult manhwa; ManhwaRead sits behind Cloudflare and needs the app to solve the challenge).
 See [Adding a provider](docs/ADDING_SOURCES.md).
+
+Search results are ordered by how well each title matches the query (exact titles first); provider hits that
+only loosely resemble the query are not shown. The filter sheet (sort, type, status, content rating, genres
+with include/exclude) searches the MangaBaka catalogue.
 
 The series description ends with a short report: linked sources, recovered chapters, possible gaps,
 untranslated range and metadata attribution.
@@ -57,6 +62,7 @@ categories):
 - **Quality** – quality optimization, mode (Best / Balanced / Data saver — uses MangaDex data-saver images), prefer original resolution, quality-based switching
 - **Chapters** – deduplication, missing-chapter recovery, source fallback, specials, alternative translations, prefer official, preferred source
 - **Metadata** – AniList, MangaBaka, preferred provider, completeness checking
+- **Content** – show 18+ content (pornographic titles in search/browse/filters, plus the adult providers); off by default
 - **Sources** – enabled providers, provider order, manual series links (`mb:3397 = weebcentral:<id>, mangapill:-`)
 - **Performance** – concurrency, timeout, metadata cache duration, cover cache, clear cache
 
@@ -84,7 +90,7 @@ Read [Architecture](docs/ARCHITECTURE.md) for the research findings and design, 
 ## Credits and licence
 
 Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
-Provider parsing for WeebCentral, MangaPill, MangaKatana, MangaRead (Madara), mgeko and Atsumaru and the JAR packaging are adapted from
+Provider parsing for WeebCentral, MangaPill, MangaKatana, MangaRead (Madara), mgeko, Atsumaru, Hiperdex (Hiper), Omega Scans (HeanCMS) and ManhwaRead and the JAR packaging are adapted from
 [keiyoushi/extensions-source](https://github.com/keiyoushi/extensions-source) (Apache-2.0).
 Metadata from [MangaBaka](https://mangabaka.org) (MangaBaka-original data CC BY-NC-SA 4.0) and
 [AniList](https://anilist.co). Library of Alexandria hosts no content.

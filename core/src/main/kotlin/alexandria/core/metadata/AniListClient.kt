@@ -51,8 +51,9 @@ class AniListClient(private val client: OkHttpClient, private val json: Json, pr
         return json.decodeFromString(AlResponse.serializer(), client.fetchText(req, limiter = limiter))
     }
 
-    suspend fun search(text: String, perPage: Int = 8): List<SeriesMetadata> {
-        val q = "query(\$s:String,\$n:Int){Page(perPage:\$n){media(search:\$s,type:MANGA,sort:SEARCH_MATCH){$mediaFields}}}"
+    suspend fun search(text: String, perPage: Int = 8, adult: Boolean = true): List<SeriesMetadata> {
+        val adultFilter = if (adult) "" else ",isAdult:false"
+        val q = "query(\$s:String,\$n:Int){Page(perPage:\$n){media(search:\$s,type:MANGA,sort:SEARCH_MATCH$adultFilter){$mediaFields}}}"
         return query(q, mapOf("s" to text, "n" to perPage)).data?.page?.media.orEmpty().map { it.toMetadata() }
     }
 

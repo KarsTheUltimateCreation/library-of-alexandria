@@ -11,6 +11,7 @@ import alexandria.core.fallback.FallbackInterceptor
 import alexandria.core.metadata.AniListClient
 import alexandria.core.metadata.MangaBakaClient
 import alexandria.core.metadata.MetadataResolver
+import alexandria.core.net.ImageHeaderInterceptor
 import alexandria.core.model.PublicationStatus
 import alexandria.core.ranking.ProviderHealth
 import alexandria.core.reconciliation.Release
@@ -64,13 +65,24 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
             .getOrElse { alexandria.core.cache.InMemoryStore() }
     }
 
-    private fun settings(): AggregatorSettings = Settings.read(preferences)
+    private fun settings(): AggregatorSettings = Settings.read(preferences, aggregator.registry.all.map { it.id })
 
     private val userAgent get() = "LibraryOfAlexandria/${BuildConfig.VERSION} (Tachiyomi extension; +https://github.com/KarsTheUltimateCreation/library-of-alexandria)"
+
+    /**
+     * Default headers, which hosts also use for browse and library covers. They have to suit every provider's
+     * cover CDN at once: MangaDex's answers browser user agents with an HTML page, so a client user agent is
+     * sent; MangaPill's refuses requests without its Referer, which no other CDN minds. Covers needing other
+     * headers (Hiperdex) get them from [ImageHeaderInterceptor] when the host loads covers through [client].
+     */
+    override fun headersBuilder(): Headers.Builder = super.headersBuilder()
+        .set("User-Agent", userAgent)
+        .set("Referer", DEFAULT_REFERER)
 
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
             .addInterceptor(FallbackInterceptor({ aggregatorOrNull?.reader }, { settings() }))
+            .addInterceptor(ImageHeaderInterceptor({ runCatching { aggregator.registry }.getOrNull() }, DEFAULT_REFERER))
             .build()
     }
 
@@ -97,7 +109,14 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
         return MangasPage(cards.map { it.toSManga() }, more)
     }
 
+    override fun getFilterList(): FilterList = Filters.list(runCatching { settings().adultContent }.getOrDefault(false))
+
     override suspend fun getSearchManga(page: Int, query: String, filters: FilterList): MangasPage {
+        val catalogFilters = runCatching { Filters.parse(filters) }.getOrNull()
+        if (catalogFilters != null && !catalogFilters.isEmpty) {
+            val (cards, more) = aggregator.browse(query.trim(), catalogFilters, page, settings())
+            return MangasPage(cards.map { it.toSManga() }, more)
+        }
         if (page > 1) return MangasPage(emptyList(), false)
         // Direct identity lookup: "mb:3397", "al:105398", "p:weebcentral:<id>" (also used for manual linking).
         SeriesKey.parse(query.trim())?.let { key ->
@@ -197,7 +216,8 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
     // ------------------------------------------------------------------ settings
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        Settings.build(screen, preferences, aggregator.registry.all.map { it.id to it.name }) { action ->
+        val registry = aggregator.registry
+        Settings.build(screen, preferences, registry.all.map { it.id to it.name }, registry.all.filter { it.adult }.map { it.id }.toSet()) { action ->
             when (action) {
                 Settings.Action.CLEAR_METADATA -> { aggregator.cache.clear("meta:"); aggregator.cache.clear("cover:") }
                 Settings.Action.CLEAR_LINKS -> { aggregator.cache.clear("state:"); aggregator.cache.clear("choice:") }
@@ -236,5 +256,6 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
     companion object {
         private const val MEMO_STATE = "loa"
         private const val MEMO_RELEASES = "r"
+        private const val DEFAULT_REFERER = "https://mangapill.com/"
     }
 }

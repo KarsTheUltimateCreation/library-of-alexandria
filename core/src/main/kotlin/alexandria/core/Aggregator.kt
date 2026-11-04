@@ -12,6 +12,7 @@ import alexandria.core.fallback.PageResolution
 import alexandria.core.fallback.ReaderResolver
 import alexandria.core.identity.IdentityResolver
 import alexandria.core.identity.MatchDecision
+import alexandria.core.metadata.CatalogFilters
 import alexandria.core.metadata.MetadataResolver
 import alexandria.core.model.ContentKind
 import alexandria.core.model.CoverCandidate
@@ -21,6 +22,7 @@ import alexandria.core.model.SourceChapter
 import alexandria.core.model.SourceSeries
 import alexandria.core.net.classify
 import alexandria.core.normalization.ChapterKind
+import alexandria.core.normalization.SearchRelevance
 import alexandria.core.normalization.TitleNormalizer
 import alexandria.core.quality.ImageProbe
 import alexandria.core.ranking.ChapterQualityAnalyzer
@@ -112,46 +114,67 @@ class Aggregator(
     private val searchCache = ConcurrentHashMap<String, Pair<Long, List<SeriesCard>>>()
 
     suspend fun search(query: String, settings: AggregatorSettings): List<SeriesCard> {
-        val cacheKey = query.trim().lowercase() + "|" + settings.searchFingerprint()
+        val q = SearchRelevance.cleanQuery(query)
+        val cacheKey = q.lowercase() + "|" + settings.searchFingerprint()
         searchCache[cacheKey]?.let { (at, cards) -> if (clock() - at < 10 * CacheManager.MINUTE) return cards }
-        return searchUncached(query, settings).also {
+        return searchUncached(q, settings).also {
             if (searchCache.size > 50) searchCache.clear()
             searchCache[cacheKey] = clock() to it
         }
     }
 
     private fun AggregatorSettings.searchFingerprint() =
-        listOf(mangabaka, anilist, metadataPreference, enabledSources.sorted(), languages, highQualityCovers).hashCode()
+        listOf(mangabaka, anilist, metadataPreference, enabledSources.sorted(), languages, highQualityCovers, adultContent).hashCode()
+
+    private class Ranked(val card: SeriesCard, val score: Double, val order: Int)
 
     private suspend fun searchUncached(query: String, settings: AggregatorSettings): List<SeriesCard> = coroutineScope {
         val metaD = async { if (settings.mangabaka || settings.anilist) metadata.search(query, settings) else emptyList() }
         // Provider hits only pre-link entries; a slow provider must not hold up the results page.
         val provD = async { searchProviders(listOf(query), settings, deadlineMs = SEARCH_DEADLINE_MS) }
-        val metas = metaD.await().filter { it.kind == ContentKind.UNKNOWN || it.kind.isComic }
+        val metas = metaD.await().filter { it.kind == ContentKind.UNKNOWN || it.kind.isComic || (settings.adultContent && it.kind == ContentKind.OTHER) }
         val hits = provD.await()
+        hits.forEach { (sid, list) -> list.forEach { registry.noteImage(it.coverUrl, sid) } }
 
         val claimed = mutableSetOf<Pair<String, String>>()
-        val withHits = mutableListOf<SeriesCard>()
-        val withoutHits = mutableListOf<SeriesCard>()
+        val ranked = mutableListOf<Ranked>()
         for (m in metas) {
             val key = keyFor(m) ?: continue
             val matched = hits.mapNotNull { (sid, list) -> identity.pick(m, list)?.let { sid to it } }
             matched.forEach { (sid, p) -> claimed += sid to p.first.id }
             rememberHints(key, m, matched.associate { (sid, p) -> sid to Binding(p.first, p.second.score, "search") })
             val card = SeriesCard(key, m.displayTitle, quickCover(m, matched.map { it.second.first }, settings))
-            if (matched.isNotEmpty()) withHits += card else withoutHits += card
+            // Entries some provider already carries are readable right away: a small boost among equals.
+            val score = SearchRelevance.score(query, m.allTitles()) + if (matched.isNotEmpty()) 0.03 else 0.0
+            ranked += Ranked(card, score, ranked.size)
         }
 
         // Provider entries that matched no metadata record become their own entries, grouped by exact title.
+        // Only close matches are kept: provider search is fuzzy ("don't tell mom" also returns "Don Dracula").
         val orphans = hits.flatMap { (sid, list) -> list.filter { (sid to it.id) !in claimed && it.kind != ContentKind.NOVEL } }
+            .filter { SearchRelevance.score(query, it.allTitles()) >= SearchRelevance.PROVIDER_HIT_MIN }
             .groupBy { TitleNormalizer.compact(it.title) + "|" + TitleNormalizer.qualifiers(it.title).sorted() }
-        val orphanCards = orphans.values.map { group ->
+        for (group in orphans.values) {
             val anchor = group.sortedBy { settings.sourceRank(it.sourceId) }.first()
             val key = SeriesKey.Provider(anchor.sourceId, anchor.id)
             rememberHints(key, null, group.distinctBy { it.sourceId }.associate { it.sourceId to Binding(it, 0.95, "search title") })
-            SeriesCard(key, anchor.title, anchor.coverUrl)
+            val cover = group.sortedBy { settings.sourceRank(it.sourceId) }.firstNotNullOfOrNull { it.coverUrl }
+            ranked += Ranked(SeriesCard(key, anchor.title, cover), SearchRelevance.score(query, group.flatMap { it.allTitles() }), ranked.size)
         }
-        withHits + orphanCards + withoutHits
+        ranked.sortedWith(compareByDescending<Ranked> { it.score }.thenBy { it.order }).map { it.card }
+    }
+
+    /**
+     * Filtered browsing (genres, status, type, sort) and filtered search, served from MangaBaka's catalogue.
+     * Returns the page's cards and whether another page exists.
+     */
+    suspend fun browse(query: String, filters: CatalogFilters, page: Int, settings: AggregatorSettings): Pair<List<SeriesCard>, Boolean> {
+        val q = SearchRelevance.cleanQuery(query)
+        val list = metadata.browse(q, filters, page, settings, limit = BROWSE_PAGE_SIZE)
+            ?: return (if (page == 1 && q.isNotBlank()) search(q, settings) else emptyList()) to false
+        val cards = list.mapNotNull { m -> keyFor(m)?.let { SeriesCard(it, m.displayTitle, quickCover(m, emptyList(), settings)) } }
+        // MangaBaka drops a few unresolved placeholder records from full pages, so a page is "full" slightly below the limit.
+        return cards to (list.size >= BROWSE_PAGE_SIZE - 5)
     }
 
     suspend fun popular(page: Int, settings: AggregatorSettings): Pair<List<SeriesCard>, Boolean> {
@@ -160,6 +183,7 @@ class Aggregator(
         }
         val adapter = registry.enabled(settings, includeUnhealthy = false).firstOrNull() ?: return emptyList<SeriesCard>() to false
         val list = guarded(adapter, settings) { adapter.popular(page) }.orEmpty()
+        list.forEach { registry.noteImage(it.coverUrl, it.sourceId) }
         return list.map { SeriesCard(SeriesKey.Provider(it.sourceId, it.id), it.title, it.coverUrl) } to list.isNotEmpty()
     }
 
@@ -168,6 +192,7 @@ class Aggregator(
             async { guarded(a, settings) { a.latest(page) }.orEmpty() }
         }.awaitAll()
         val merged = lists.flatten().distinctBy { TitleNormalizer.compact(it.title) }
+        merged.forEach { registry.noteImage(it.coverUrl, it.sourceId) }
         merged.map { SeriesCard(SeriesKey.Provider(it.sourceId, it.id), it.title, it.coverUrl) } to merged.isNotEmpty()
     }
 
@@ -424,6 +449,7 @@ class Aggregator(
                 }
             }.awaitAll().forEach { candidates += it }
         }
+        candidates.forEach { c -> if (registry[c.provider] != null) registry.noteImage(c.url, c.provider) }
         if (candidates.isEmpty()) meta?.covers?.let { candidates += it }
         val ranked = covers.rank(candidates, settings, meta?.originalLanguage, primaryBinding(state, settings))
         if (settings.cacheCovers && ranked.isNotEmpty()) {
@@ -537,6 +563,7 @@ class Aggregator(
 
     private companion object {
         const val SEARCH_DEADLINE_MS = 6_000L
+        const val BROWSE_PAGE_SIZE = 30
     }
 
     private fun keyFor(m: SeriesMetadata): SeriesKey? =

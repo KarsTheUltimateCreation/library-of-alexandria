@@ -21,6 +21,7 @@ class MangaPillAdapter(ctx: AdapterContext) : HtmlAdapter(ctx) {
     override val baseUrl = "https://mangapill.com"
     override val languages: Set<String> = setOf("en")
     override val limiter: RateLimiter = RateLimiter.shared("mangapill", 2, 1_000)
+    override val imageHosts = setOf("readdetectiveconan.com")
 
     override suspend fun search(query: String): List<SourceSeries> {
         val url = "$baseUrl/search".toHttpUrl().newBuilder().addQueryParameter("q", query).addQueryParameter("page", "1").build()
