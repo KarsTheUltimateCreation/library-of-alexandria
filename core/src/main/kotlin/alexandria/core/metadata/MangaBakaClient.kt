@@ -161,6 +161,7 @@ class MangaBakaClient(private val client: OkHttpClient, private val json: Json, 
             covers = listOfNotNull(coverRaw?.let { imageCandidate(it, null) }),
             thumbnailUrl = ((o["cover"] as? JsonObject)?.get("x350") as? JsonObject)?.get("x2")?.jsonPrimitive?.contentOrNull,
             webUrl = str("canonical_url") ?: "https://mangabaka.org/$id",
+            adult = str("content_rating")?.lowercase() in CatalogFilters.ADULT_RATINGS,
         )
     }
 }

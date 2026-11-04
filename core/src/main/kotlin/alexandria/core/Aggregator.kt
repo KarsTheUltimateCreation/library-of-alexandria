@@ -30,9 +30,16 @@ import alexandria.core.ranking.SourceRanker
 import alexandria.core.reconciliation.CanonicalChapter
 import alexandria.core.reconciliation.ChapterReconciler
 import alexandria.core.reconciliation.Release
+import alexandria.core.sources.ProviderRole
 import alexandria.core.sources.SourceAdapter
 import alexandria.core.sources.SourceRegistry
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -124,7 +131,7 @@ class Aggregator(
     }
 
     private fun AggregatorSettings.searchFingerprint() =
-        listOf(mangabaka, anilist, metadataPreference, enabledSources.sorted(), languages, highQualityCovers, adultContent).hashCode()
+        listOf(mangabaka, anilist, metadataPreference, enabledSources.sorted(), languages, highQualityCovers).hashCode()
 
     private class Ranked(val card: SeriesCard, val score: Double, val order: Int)
 
@@ -132,7 +139,7 @@ class Aggregator(
         val metaD = async { if (settings.mangabaka || settings.anilist) metadata.search(query, settings) else emptyList() }
         // Provider hits only pre-link entries; a slow provider must not hold up the results page.
         val provD = async { searchProviders(listOf(query), settings, deadlineMs = SEARCH_DEADLINE_MS) }
-        val metas = metaD.await().filter { it.kind == ContentKind.UNKNOWN || it.kind.isComic || (settings.adultContent && it.kind == ContentKind.OTHER) }
+        val metas = metaD.await().filter { it.kind == ContentKind.UNKNOWN || it.kind.isComic || it.kind == ContentKind.OTHER }
         val hits = provD.await()
         hits.forEach { (sid, list) -> list.forEach { registry.noteImage(it.coverUrl, sid) } }
 
@@ -140,7 +147,9 @@ class Aggregator(
         val ranked = mutableListOf<Ranked>()
         for (m in metas) {
             val key = keyFor(m) ?: continue
-            val matched = hits.mapNotNull { (sid, list) -> identity.pick(m, list)?.let { sid to it } }
+            // Gallery sites hold one-shots, never the catalogue series itself: their hits stay standalone entries.
+            val matched = hits.filterKeys { registry[it]?.role == ProviderRole.SERIES }
+                .mapNotNull { (sid, list) -> identity.pick(m, list)?.let { sid to it } }
             matched.forEach { (sid, p) -> claimed += sid to p.first.id }
             rememberHints(key, m, matched.associate { (sid, p) -> sid to Binding(p.first, p.second.score, "search") })
             val card = SeriesCard(key, m.displayTitle, quickCover(m, matched.map { it.second.first }, settings))
@@ -151,7 +160,8 @@ class Aggregator(
 
         // Provider entries that matched no metadata record become their own entries, grouped by exact title.
         // Only close matches are kept: provider search is fuzzy ("don't tell mom" also returns "Don Dracula").
-        val orphans = hits.flatMap { (sid, list) -> list.filter { (sid to it.id) !in claimed && it.kind != ContentKind.NOVEL } }
+        val orphans = hits.filterKeys { registry[it]?.standaloneResults != false }
+            .flatMap { (sid, list) -> list.filter { (sid to it.id) !in claimed && it.kind != ContentKind.NOVEL } }
             .filter { SearchRelevance.score(query, it.allTitles()) >= SearchRelevance.PROVIDER_HIT_MIN }
             .groupBy { TitleNormalizer.compact(it.title) + "|" + TitleNormalizer.qualifiers(it.title).sorted() }
         for (group in orphans.values) {
@@ -181,14 +191,14 @@ class Aggregator(
         metadata.popular(page, settings)?.takeIf { it.isNotEmpty() }?.let { list ->
             return list.mapNotNull { m -> keyFor(m)?.let { SeriesCard(it, m.displayTitle, quickCover(m, emptyList(), settings)) } } to true
         }
-        val adapter = registry.enabled(settings, includeUnhealthy = false).firstOrNull() ?: return emptyList<SeriesCard>() to false
+        val adapter = registry.forBrowsing(settings).firstOrNull() ?: return emptyList<SeriesCard>() to false
         val list = guarded(adapter, settings) { adapter.popular(page) }.orEmpty()
         list.forEach { registry.noteImage(it.coverUrl, it.sourceId) }
         return list.map { SeriesCard(SeriesKey.Provider(it.sourceId, it.id), it.title, it.coverUrl) } to list.isNotEmpty()
     }
 
     suspend fun latest(page: Int, settings: AggregatorSettings): Pair<List<SeriesCard>, Boolean> = coroutineScope {
-        val lists = registry.enabled(settings, includeUnhealthy = false).take(2).map { a ->
+        val lists = registry.forBrowsing(settings).take(2).map { a ->
             async { guarded(a, settings) { a.latest(page) }.orEmpty() }
         }.awaitAll()
         val merged = lists.flatten().distinctBy { TitleNormalizer.compact(it.title) }
@@ -198,7 +208,40 @@ class Aggregator(
 
     // ---------------------------------------------------------------- details + chapters
 
+    /** Updates in progress: hosts often ask for the same series twice at once (details, then chapters). */
+    private val inflight = ConcurrentHashMap<String, CompletableDeferred<SeriesUpdate>>()
+
     suspend fun update(
+        key: SeriesKey,
+        knownState: SeriesState?,
+        fetchDetails: Boolean,
+        fetchChapters: Boolean,
+        settings: AggregatorSettings,
+    ): SeriesUpdate {
+        val flightKey = "${key.value}|$fetchDetails|$fetchChapters"
+        val mine = CompletableDeferred<SeriesUpdate>()
+        inflight.putIfAbsent(flightKey, mine)?.let { running ->
+            // Join the identical request already running instead of repeating every network call.
+            try {
+                return running.await()
+            } catch (e: CancellationException) {
+                currentCoroutineContext().ensureActive() // we were cancelled ourselves
+            } catch (e: Exception) {
+                // The other caller failed; try once on our own below.
+            }
+            return updateNow(key, knownState, fetchDetails, fetchChapters, settings)
+        }
+        return try {
+            updateNow(key, knownState, fetchDetails, fetchChapters, settings).also { mine.complete(it) }
+        } catch (e: Throwable) {
+            mine.completeExceptionally(e)
+            throw e
+        } finally {
+            inflight.remove(flightKey, mine)
+        }
+    }
+
+    private suspend fun updateNow(
         key: SeriesKey,
         knownState: SeriesState?,
         fetchDetails: Boolean,
@@ -210,7 +253,9 @@ class Aggregator(
         // 1. Identity / metadata.
         if (fetchDetails || state.metadata == null) {
             val anchor = (key as? SeriesKey.Provider)?.let { providerAnchor(it, state, settings) }
-            val meta = metadata.forKey(key, settings, anchor) ?: state.metadata ?: anchor?.asMetadata()
+            // A gallery is its own work: no catalogue lookup (it would only risk a false match).
+            val meta = if (isGallery(key)) anchor?.asMetadata() ?: state.metadata
+            else metadata.forKey(key, settings, anchor) ?: state.metadata ?: anchor?.asMetadata()
             state = state.copy(metadata = meta)
             if (anchor != null) state = state.copy(bindings = state.bindings + (anchor.sourceId to Binding(anchor, 1.0, "entry source")))
         }
@@ -241,8 +286,9 @@ class Aggregator(
         val lists = bound.map { (sid, b) ->
             async {
                 val adapter = registry[sid] ?: return@async sid to emptyList<SourceChapter>()
-                val fresh = gate.withPermit { guarded(adapter, settings) { adapter.chapters(b.series, settings.languages) } }
                 val cacheKey = "ch:$sid:${b.series.id}"
+                // A provider in cool-down would only time out again: use its last known list straight away.
+                val fresh = if (registry.health.isCircuitOpen(sid)) null else gate.withPermit { guarded(adapter, settings) { adapter.chapters(b.series, settings.languages) } }
                 if (fresh != null) {
                     cache.put(cacheKey, ListSerializer(SourceChapter.serializer()), fresh, persist = false)
                     sid to fresh
@@ -319,6 +365,17 @@ class Aggregator(
         return resolution.copy(pages = pages)
     }
 
+    /**
+     * Resolves a lazy page ([alexandria.core.model.ReaderPage.lazy]) handed out by [pages] into its image URL,
+     * tagged for page fallback like any other page.
+     */
+    suspend fun resolveImage(pageRef: String, settings: AggregatorSettings): String {
+        val token = FallbackInterceptor.pageToken(pageRef) ?: throw IllegalArgumentException("Not a Library of Alexandria page: $pageRef")
+        val adapter = token.sourceId?.let { registry[it] } ?: throw IllegalStateException("Unknown provider for page $pageRef")
+        val page = withTimeout(settings.requestTimeoutSeconds * 1000L) { adapter.resolveImage(FallbackInterceptor.stripTag(pageRef)) }
+        return FallbackInterceptor.tagPage(page.imageUrl, token.chapterRef, token.index, adapter.id)
+    }
+
     // ---------------------------------------------------------------- binding
 
     private suspend fun resolveBindings(key: SeriesKey, meta: SeriesMetadata, state0: SeriesState, settings: AggregatorSettings): SeriesState {
@@ -341,7 +398,10 @@ class Aggregator(
 
         // Links pre-made from search results are title-only. Verify them with provider details (year,
         // tracker ids, alt titles) before trusting them, exactly like a normal match.
-        val unverified = state.bindings.filter { (sid, b) -> !b.manual && !b.series.detailed && b.series.ids.isEmpty && registry[sid] != null }
+        // Gallery copies were grouped by exact title in search; galleries carry no ids or years to verify against.
+        val unverified = state.bindings.filter { (sid, b) ->
+            !b.manual && !b.series.detailed && b.series.ids.isEmpty && registry[sid] != null && registry[sid]?.role != ProviderRole.GALLERY
+        }
         val verified = coroutineScope {
             unverified.map { (sid, b) -> async { Triple(sid, b, guarded(registry[sid]!!, settings) { registry[sid]!!.details(b.series) }) } }.awaitAll()
         }
@@ -357,9 +417,11 @@ class Aggregator(
         }
 
         val now = clock()
+        if (isGallery(key)) return state // other sites' copies were linked from search; series providers never carry it
         // Re-search providers that had no match weekly, not on every library refresh.
         val missTtl = 7 * CacheManager.DAY
-        val toFind = registry.enabled(settings, includeUnhealthy = false).filter { a ->
+        val adultSeries = meta.looksAdult || state.bindings.keys.any { registry[it]?.adult == true }
+        val toFind = registry.forLinking(settings, adultSeries).filter { a ->
             a.id !in state.bindings && (state.misses[a.id]?.let { now - it > missTtl } ?: true)
         }
         if (toFind.isEmpty()) return state
@@ -397,24 +459,37 @@ class Aggregator(
         deadlineMs: Long? = null,
         stopWhen: (List<SourceSeries>) -> Boolean = { false },
     ): Map<String, List<SourceSeries>> = coroutineScope {
-        val gate = Semaphore(settings.maxConcurrentSearches.coerceIn(1, 6))
+        // A user search asks every provider once, each a different host with its own rate limiter: no shared gate.
+        // Linking searches send several title variants per provider and stay bounded.
+        val gate = Semaphore(if (deadlineMs != null) adapters.size.coerceAtLeast(1) else settings.maxConcurrentSearches.coerceIn(1, 8))
         adapters.map { a ->
             async {
-                val collected = mutableListOf<SourceSeries>()
+                val collected = java.util.Collections.synchronizedList(mutableListOf<SourceSeries>())
                 var anySuccess = false
                 val work: suspend () -> Unit = {
                     for (q in queries.filter { it.isNotBlank() }) {
                         val r = gate.withPermit { guarded(a, settings) { a.search(q) } } ?: continue
                         anySuccess = true
                         collected += r
-                        if (stopWhen(collected) || r.any { TitleNormalizer.compact(it.title) == TitleNormalizer.compact(q) }) break
+                        if (stopWhen(collected.toList()) || r.any { TitleNormalizer.compact(it.title) == TitleNormalizer.compact(q) }) break
                     }
                 }
-                if (deadlineMs != null) withTimeoutOrNull(deadlineMs) { work() } else work()
-                if (anySuccess) a.id to collected.distinctBy { it.id } else null
+                if (deadlineMs != null) {
+                    // Detached, so a provider stuck in a blocking read cannot hold the results page past the deadline.
+                    // A late provider is left to finish (its own timeout still applies): that warms its caches and
+                    // health stats, so the next search includes it.
+                    val job = detached.async { work() }
+                    withTimeoutOrNull(deadlineMs) { job.await() }
+                } else {
+                    work()
+                }
+                if (anySuccess) a.id to collected.toList().distinctBy { it.id } else null
             }
         }.awaitAll().filterNotNull().toMap()
     }
+
+    /** Scope for provider calls whose results are optional and must never delay the caller. */
+    private val detached = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private suspend fun providerAnchor(key: SeriesKey.Provider, state: SeriesState, settings: AggregatorSettings): SourceSeries? {
         val adapter = registry[key.sourceId] ?: return state.bindings[key.sourceId]?.series
@@ -425,7 +500,8 @@ class Aggregator(
     // ---------------------------------------------------------------- covers
 
     private suspend fun resolveCover(key: SeriesKey, state: SeriesState, settings: AggregatorSettings): List<ScoredCover> {
-        val cacheKey = "cover:${key.value}:${settings.highQualityCovers}:${settings.coverProvider}:${settings.preferOriginalArtwork}"
+        // v2: entries cached before 1.6.5 may hold MangaDex covers, which load as a placeholder image.
+        val cacheKey = "cover:v2:${key.value}:${settings.highQualityCovers}:${settings.coverProvider}:${settings.preferOriginalArtwork}"
         if (settings.cacheCovers) {
             cache.get(cacheKey, ListSerializer(CoverCandidate.serializer()), 7 * CacheManager.DAY)?.let { cached ->
                 return cached.map { ScoredCover(it, 0.0, true, emptyList()) }
@@ -462,8 +538,9 @@ class Aggregator(
         state.bindings.keys.sortedBy { settings.sourceRank(it) }.firstOrNull()
 
     /** Browse-grid thumbnail: small pre-resized art; the full-quality cover is chosen when the series is opened. */
-    private fun quickCover(m: SeriesMetadata, hits: List<SourceSeries>, settings: AggregatorSettings): String? {
+    private fun quickCover(m: SeriesMetadata, hits0: List<SourceSeries>, settings: AggregatorSettings): String? {
         val meta = m.thumbnailUrl ?: m.covers.sortedByDescending { it.coverOrigin.trust }.firstOrNull()?.url
+        val hits = hits0.filter { registry[it.sourceId]?.standaloneResults != false }
         return if (settings.highQualityCovers) meta ?: hits.firstNotNullOfOrNull { it.coverUrl } else hits.firstNotNullOfOrNull { it.coverUrl } ?: meta
     }
 
@@ -566,13 +643,15 @@ class Aggregator(
         const val BROWSE_PAGE_SIZE = 30
     }
 
+    private fun isGallery(key: SeriesKey) = key is SeriesKey.Provider && registry[key.sourceId]?.role == ProviderRole.GALLERY
+
     private fun keyFor(m: SeriesMetadata): SeriesKey? =
         m.ids.mangabaka?.let { SeriesKey.MangaBaka(it) } ?: m.ids.anilist?.let { SeriesKey.AniList(it) }
 
     private suspend fun <T> guarded(adapter: SourceAdapter, settings: AggregatorSettings, block: suspend () -> T): T? {
         val started = clock()
         return try {
-            withTimeout(settings.requestTimeoutSeconds * 1000L) { block() }.also {
+            withTimeout(registry.health.timeoutFor(adapter.id, settings.requestTimeoutSeconds * 1000L)) { block() }.also {
                 registry.health.recordSuccess(adapter.id, clock() - started)
             }
         } catch (e: Exception) {

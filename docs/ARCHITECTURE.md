@@ -73,7 +73,7 @@ core/                         pure Kotlin/JVM, unit-testable, no Android APIs
   quality/                    ImageProbe (dimensions from the first bytes, Range requests)
   fallback/                   ReaderResolver (per-chapter selection), FallbackInterceptor (image-level)
   metadata/                   MangaBakaClient, AniListClient, MetadataResolver
-  sources/                    SourceAdapter, SourceRegistry, adapters/{MangaDex,WeebCentral,MangaPill,MangaKatana,MangaRead,Mgeko,Atsumaru,Hiperdex,OmegaScans,ManhwaRead}
+  sources/                    SourceAdapter, SourceRegistry, adapters/{MangaDex,WeebCentral,MangaPill,MangaKatana,MangaRead,Mgeko,Atsumaru,Hiperdex,OmegaScans,ManhwaRead,Hentai20,Hentai2Read,NHentai,Hitomi,EHentai,Pururin}
   cache/                      CacheManager over a KeyValueStore
   Aggregator.kt               orchestration used by the extension
 extension/                    Android app module: HttpSource + ConfigurableSource glue, settings, icon

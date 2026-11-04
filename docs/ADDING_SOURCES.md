@@ -36,6 +36,15 @@ class ExampleAdapter(ctx: AdapterContext) : HtmlAdapter(ctx) {
 }
 ```
 
+Classify the provider so it is only asked when it can help (this is what keeps opening a series fast):
+
+- `adult = true` – adult content; searched to link a catalogue series only when that series is adult.
+- `role = ProviderRole.GALLERY` – single galleries (doujinshi): standalone search results with one chapter
+  (`Galleries.chapter`), never searched to link catalogue series.
+- `standaloneResults = false` – hits are only used to link catalogue entries, never listed on their own.
+- Pages that must be fetched to learn the image address: return `ReaderPage(lazy = true)` and implement
+  `resolveImage` (resolved one page at a time while reading).
+
 Guidelines:
 
 - `SourceSeries.id` / `SourceChapter.id` must be **stable** (a path or numeric id, not a full URL with

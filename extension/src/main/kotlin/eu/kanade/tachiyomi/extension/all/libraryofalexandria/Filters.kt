@@ -69,13 +69,13 @@ object Filters {
 
     private class GenreGroup(options: List<Option>) : Filter.Group<GenreState>("Genres (tap twice to exclude)", options.map { GenreState(it) })
 
-    fun list(adult: Boolean): FilterList = FilterList(
+    fun list(): FilterList = FilterList(
         Filter.Header("Filters search the MangaBaka catalogue"),
         SortFilter(),
         OptionGroup("Type", TYPES),
         OptionGroup("Status", STATUSES),
-        OptionGroup("Content rating", if (adult) RATINGS else RATINGS.filter { it.value != "pornographic" }),
-        GenreGroup(if (adult) GENRES else GENRES.filter { it.value !in CatalogFilters.ADULT_GENRES }),
+        OptionGroup("Content rating", RATINGS),
+        GenreGroup(GENRES),
     )
 
     fun parse(filters: FilterList): CatalogFilters {

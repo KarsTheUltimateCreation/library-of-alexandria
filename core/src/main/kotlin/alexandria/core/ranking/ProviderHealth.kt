@@ -22,8 +22,11 @@ data class HealthStats(
 }
 
 /**
- * Tracks request outcomes per provider (persisted, decayed) and implements a small circuit breaker:
- * after repeated consecutive failures a provider is skipped for searches for a cool-down period.
+ * Tracks request outcomes per provider (persisted, decayed) and uses them to keep requests fast:
+ *  - a circuit breaker: after 3 consecutive failures a provider is skipped for a cool-down that doubles with every
+ *    further failure (2, 4, 8 ... up to 30 minutes), so a site that is down stops costing a timeout on every call;
+ *  - adaptive timeouts ([timeoutFor]): a provider that usually answers in 800 ms is given a few seconds, not the
+ *    full maximum, so one stalled request no longer holds up a whole search or chapter list.
  */
 class ProviderHealth(private val store: KeyValueStore?, private val clock: () -> Long = System::currentTimeMillis) {
     private val stats = ConcurrentHashMap<String, HealthStats>()
@@ -62,10 +65,22 @@ class ProviderHealth(private val store: KeyValueStore?, private val clock: () ->
         maybePersist()
     }
 
-    /** True while a provider is in cool-down after ≥4 consecutive failures (10 minutes). */
+    /** True while a provider is in cool-down after ≥3 consecutive failures (2 minutes, doubling, at most 30). */
     fun isCircuitOpen(source: String): Boolean {
         val s = stats[source] ?: return false
-        return s.consecutiveFailures >= 4 && clock() - s.lastFailureAt < 10 * 60_000L
+        if (s.consecutiveFailures < 3) return false
+        val coolDown = (2 * 60_000L shl (s.consecutiveFailures - 3).coerceAtMost(4)).coerceAtMost(30 * 60_000L)
+        return clock() - s.lastFailureAt < coolDown
+    }
+
+    /**
+     * Timeout for one call to [source]: about five times its usual latency plus a margin, between [MIN_TIMEOUT_MS]
+     * and [maxMs]. Providers without enough history (or that recently timed out) get [maxMs].
+     */
+    fun timeoutFor(source: String, maxMs: Long): Long {
+        val s = stats[source] ?: return maxMs
+        if (s.successes < 3 || s.avgLatencyMs <= 0 || s.consecutiveFailures > 0) return maxMs
+        return (s.avgLatencyMs * 5 + 2_000).coerceIn(MIN_TIMEOUT_MS.coerceAtMost(maxMs), maxMs)
     }
 
     fun reset() {
@@ -88,5 +103,6 @@ class ProviderHealth(private val store: KeyValueStore?, private val clock: () ->
 
     companion object {
         const val KEY = "loa.health"
+        const val MIN_TIMEOUT_MS = 6_000L
     }
 }

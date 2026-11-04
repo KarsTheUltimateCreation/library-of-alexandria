@@ -14,6 +14,18 @@ import okhttp3.Request
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 
+/** What a provider's entries are. */
+enum class ProviderRole {
+    /** Ongoing series with chapter lists; linked to catalogue entries (MangaBaka / AniList). */
+    SERIES,
+
+    /**
+     * Single-gallery sites (doujinshi, one-shots: nhentai, E-Hentai, ...). Their entries are standalone search
+     * results with one chapter; they are never searched to link catalogue series, which keeps opening a series fast.
+     */
+    GALLERY,
+}
+
 /**
  * Internal contract every content provider implements. This is *not* the Mihon extension API: providers are
  * bundled inside Library of Alexandria because installed extensions cannot call one another (Mihon only exposes
@@ -27,8 +39,16 @@ interface SourceAdapter {
     /** Languages this provider serves, or null when it is multilingual and filters server-side. */
     val languages: Set<String>?
 
-    /** Adult (18+) provider: only searched or used when the user enabled 18+ content. */
+    /** Adult (18+) provider: searched to link a catalogue series only when that series is adult content. */
     val adult: Boolean get() = false
+
+    val role: ProviderRole get() = ProviderRole.SERIES
+
+    /**
+     * Whether hits that match no catalogue entry may appear as search results of their own. MangaDex's are hidden:
+     * its catalogue is mirrored by MangaBaka, and its image CDN serves a placeholder to other sites' requests.
+     */
+    val standaloneResults: Boolean get() = true
 
     /**
      * Image hosts (suffix match) whose requests need [imageHeaders]. Used to add the right Referer to cover
@@ -56,6 +76,9 @@ interface SourceAdapter {
 
     /** Headers needed to load this provider's images (Referer, etc.). */
     fun imageHeaders(imageUrl: String): Map<String, String> = emptyMap()
+
+    /** Resolves a [ReaderPage.lazy] viewer page into the actual image. */
+    suspend fun resolveImage(pageUrl: String): ReaderPage = throw UnsupportedOperationException("$id has no lazy pages")
 
     fun seriesWebUrl(seriesId: String): String
     fun chapterWebUrl(chapter: SourceChapter): String = chapter.webUrl ?: seriesWebUrl(chapter.seriesId)

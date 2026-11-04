@@ -107,6 +107,11 @@ data class CoverCandidate(
     /** Language of the cover edition when known (e.g. a translated volume cover). */
     val language: String? = null,
     val headers: Map<String, String> = emptyMap(),
+    /**
+     * [imageUrl] is a viewer page that has to be fetched to learn the actual image address (E-Hentai). The host
+     * resolves such pages one by one while reading, through [alexandria.core.sources.SourceAdapter.resolveImage].
+     */
+    val lazy: Boolean = false,
 ) {
     val coverOrigin: CoverOrigin get() = runCatching { CoverOrigin.valueOf(origin) }.getOrDefault(CoverOrigin.PROVIDER_THUMBNAIL)
 }
@@ -135,7 +140,13 @@ data class SeriesMetadata(
     /** Small pre-resized image for browse grids (never used as the final cover). */
     val thumbnailUrl: String? = null,
     val webUrl: String? = null,
+    /** Rated erotica/pornographic by the metadata service (MangaBaka content rating, AniList isAdult). */
+    val adult: Boolean = false,
 ) {
+    /** Adult by rating or by genre; only then are the adult providers searched when linking this series. */
+    val looksAdult: Boolean
+        get() = adult || genres.any { g -> g.trim().lowercase() in ADULT_GENRES }
+
     /**
      * What users see. The extension is English-only, so the English title wins over the database's main title
      * (MangaBaka's `title` is the romanized original for many non-Japanese works, e.g. "Yongsaneun Swil Su Eopda").
@@ -166,6 +177,10 @@ data class SeriesMetadata(
             .filter { it.isNotEmpty() }
             .distinctBy { it.lowercase() }
             .take(max)
+
+    companion object {
+        val ADULT_GENRES = setOf("hentai", "smut", "adult", "erotica", "pornographic")
+    }
 }
 
 /** A series as listed by one content provider. */
@@ -237,4 +252,9 @@ data class ReaderPage(
     val index: Int,
     val imageUrl: String,
     val headers: Map<String, String> = emptyMap(),
+    /**
+     * [imageUrl] is a viewer page that has to be fetched to learn the actual image address (E-Hentai). The host
+     * resolves such pages one by one while reading, through [alexandria.core.sources.SourceAdapter.resolveImage].
+     */
+    val lazy: Boolean = false,
 )

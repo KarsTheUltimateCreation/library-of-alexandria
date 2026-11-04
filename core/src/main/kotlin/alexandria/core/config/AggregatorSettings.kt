@@ -43,20 +43,14 @@ data class AggregatorSettings(
     val metadataPreference: MetadataPreference = MetadataPreference.AUTO,
     val completenessChecking: Boolean = true,
 
-    // Content
-    /**
-     * 18+ content. Off: pornographic titles are excluded from metadata search/browse and adult-only providers
-     * ([alexandria.core.sources.SourceAdapter.adult]) are never used. On: everything is searchable.
-     */
-    val adultContent: Boolean = false,
-
     // Sources
     val enabledSources: Set<String> = emptySet(),
     /** Manual links: canonical series key -> list of "sourceId:seriesId" (or "sourceId:-" to unlink). */
     val manualLinks: Map<String, List<String>> = emptyMap(),
 
-    // Performance
-    val maxConcurrentSearches: Int = 3,
+    // Performance (not user-facing: timeouts adapt to each provider's measured latency, see ProviderHealth)
+    val maxConcurrentSearches: Int = 6,
+    /** Upper bound for one provider call; healthy, fast providers get a much shorter adaptive timeout. */
     val requestTimeoutSeconds: Int = 20,
     val metadataCacheHours: Int = 72,
     val chapterCacheMinutes: Int = 30,

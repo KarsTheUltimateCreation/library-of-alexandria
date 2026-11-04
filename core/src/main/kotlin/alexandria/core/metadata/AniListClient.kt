@@ -29,7 +29,7 @@ class AniListClient(private val client: OkHttpClient, private val json: Json, pr
     private val mediaFields = """
         id idMal title { romaji english native } synonyms format status countryOfOrigin chapters
         startDate { year } description(asHtml: false) genres coverImage { extraLarge large }
-        staff(perPage: 4) { edges { role node { name { full } } } } siteUrl
+        staff(perPage: 4) { edges { role node { name { full } } } } siteUrl isAdult
     """.trimIndent()
 
     private suspend fun query(query: String, variables: Map<String, Any>): AlResponse {
@@ -58,7 +58,7 @@ class AniListClient(private val client: OkHttpClient, private val json: Json, pr
     }
 
     suspend fun popular(page: Int, perPage: Int = 30): List<SeriesMetadata> {
-        val q = "query(\$p:Int,\$n:Int){Page(page:\$p,perPage:\$n){media(type:MANGA,sort:POPULARITY_DESC,isAdult:false){$mediaFields}}}"
+        val q = "query(\$p:Int,\$n:Int){Page(page:\$p,perPage:\$n){media(type:MANGA,sort:POPULARITY_DESC){$mediaFields}}}"
         return query(q, mapOf("p" to page, "n" to perPage)).data?.page?.media.orEmpty().map { it.toMetadata() }
     }
 
@@ -103,6 +103,7 @@ class AniListClient(private val client: OkHttpClient, private val json: Json, pr
             ),
             thumbnailUrl = coverImage?.large ?: coverImage?.extraLarge,
             webUrl = siteUrl ?: "https://anilist.co/manga/$id",
+            adult = isAdult == true,
         )
     }
 
@@ -132,6 +133,7 @@ class AniListClient(private val client: OkHttpClient, private val json: Json, pr
     val coverImage: AlCover? = null,
     val staff: AlStaff? = null,
     val siteUrl: String? = null,
+    val isAdult: Boolean? = null,
 )
 @Serializable internal data class AlTitle(val romaji: String? = null, val english: String? = null, val native: String? = null)
 @Serializable internal data class AlDate(val year: Int? = null)

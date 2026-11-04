@@ -63,7 +63,8 @@ suspend fun OkHttpClient.fetch(request: Request, retries: Int = 2, limiter: Rate
             val error = HttpError(code, request.url.toString(), retryAfter)
             if (attempt < retries && (code == 429 || code in 500..599)) {
                 attempt++
-                delay(((retryAfter ?: (attempt * 2L)).coerceIn(1, 15)) * 1000)
+                // Short waits only: a long Retry-After would stall the whole page; the next refresh retries anyway.
+                delay(((retryAfter ?: (attempt * 2L)).coerceIn(1, 5)) * 1000)
                 continue
             }
             throw error

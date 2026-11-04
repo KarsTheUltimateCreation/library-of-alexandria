@@ -19,11 +19,10 @@ data class CatalogFilters(
         /** Comic formats; MangaBaka also catalogues novels. */
         val COMIC_TYPES = listOf("manga", "manhwa", "manhua", "oel")
 
-        /** Without 18+ content only pornographic titles are hidden (MangaBaka rates e.g. Berserk "erotica"). */
         val NON_ADULT_RATINGS = listOf("safe", "suggestive", "erotica")
         val ALL_RATINGS = listOf("safe", "suggestive", "erotica", "pornographic")
 
-        /** Genres that only make sense with 18+ content enabled. */
-        val ADULT_GENRES = setOf("adult", "hentai", "smut", "erotica", "lolicon", "shotacon")
+        /** Ratings that mark a series as adult content (MangaBaka rates e.g. Berserk "erotica", so that is not one). */
+        val ADULT_RATINGS = setOf("pornographic")
     }
 }

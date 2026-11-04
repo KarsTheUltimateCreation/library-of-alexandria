@@ -121,35 +121,21 @@ class MangaDexAdapter(private val ctx: AdapterContext) : SourceAdapter {
         return files.mapIndexed { i, f -> ReaderPage(i, "${res.baseUrl}/$dir/${res.chapter.hash}/$f") }
     }
 
-    override suspend fun covers(series: SourceSeries): List<CoverCandidate> {
-        val url = "$api/cover".toHttpUrl().newBuilder()
-            .addQueryParameter("manga[]", series.id)
-            .addQueryParameter("limit", "100")
-            .addQueryParameter("order[volume]", "asc")
-            .build()
-        val main = series.coverUrl
-        val all = runCatching { get<MdList<MdCover>>(url).data }.getOrDefault(emptyList())
-        val candidates = all.map { c ->
-            CoverCandidate(
-                url = "https://uploads.mangadex.org/covers/${series.id}/${c.attributes.fileName}",
-                provider = id,
-                origin = CoverOrigin.PROVIDER_ORIGINAL.name,
-                language = c.attributes.locale,
-            )
-        }
-        // Main cover first, then the rest (volume order).
-        val mainOriginal = main?.removeSuffix(".512.jpg")
-        return candidates.sortedBy { if (it.url == mainOriginal) 0 else 1 }.ifEmpty {
-            listOfNotNull(mainOriginal?.let { CoverCandidate(it, id, CoverOrigin.PROVIDER_ORIGINAL.name) })
-        }
-    }
+    /**
+     * No covers from MangaDex: uploads.mangadex.org answers requests carrying another site's Referer (which hosts
+     * send with every cover) with a "read this at MangaDex" placeholder image, and MangaBaka mirrors its artwork.
+     */
+    override suspend fun covers(series: SourceSeries): List<CoverCandidate> = emptyList()
+
+    /** MangaDex's catalogue is mirrored by MangaBaka; its unmatched hits are only used to link, never listed. */
+    override val standaloneResults = false
 
     override fun seriesWebUrl(seriesId: String) = "$baseUrl/title/$seriesId"
 
-    /** uploads.mangadex.org answers browser user agents with an HTML page instead of the cover image. */
+    /** uploads.mangadex.org answers browser user agents with an HTML page, and foreign Referers with a placeholder. */
     override val imageHosts = setOf("uploads.mangadex.org")
 
-    override fun imageHeaders(imageUrl: String): Map<String, String> = mapOf("User-Agent" to ctx.appUserAgent)
+    override fun imageHeaders(imageUrl: String): Map<String, String> = mapOf("User-Agent" to ctx.appUserAgent, "Referer" to "$baseUrl/")
     override fun chapterWebUrl(chapter: SourceChapter) = "$baseUrl/chapter/${chapter.id}"
 
     private fun MdManga.toSeries(): SourceSeries {
@@ -157,7 +143,6 @@ class MangaDexAdapter(private val ctx: AdapterContext) : SourceAdapter {
         val titles = a.title.values.toList()
         val alt = a.altTitles.flatMap { it.values }
         val links = (a.links as? JsonObject)?.mapValues { runCatching { it.value.jsonPrimitive.content }.getOrNull() } ?: emptyMap()
-        val cover = relationships.firstOrNull { it.type == "cover_art" }?.attributes?.let { (it as? JsonObject)?.get("fileName")?.jsonPrimitive?.content }
         val en = a.title["en"] ?: a.altTitles.firstNotNullOfOrNull { it["en"] }
         val primary = en ?: titles.firstOrNull() ?: id
         val description = (a.description as? JsonObject)?.let { d -> (d["en"] ?: d.values.firstOrNull())?.jsonPrimitive?.content }
@@ -166,7 +151,7 @@ class MangaDexAdapter(private val ctx: AdapterContext) : SourceAdapter {
             id = id,
             title = primary,
             altTitles = (titles + alt).filter { it != primary }.distinct(),
-            coverUrl = cover?.let { "https://uploads.mangadex.org/covers/$id/$it.512.jpg" },
+            coverUrl = null, // see covers()
             ids = ExternalIds(
                 anilist = links["al"]?.toLongOrNull(),
                 mal = links["mal"]?.toLongOrNull(),

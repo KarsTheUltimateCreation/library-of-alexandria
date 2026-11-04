@@ -58,16 +58,15 @@ class MetadataResolver(
     }
 
     suspend fun search(query: String, settings: AggregatorSettings, limit: Int = 12): List<SeriesMetadata> {
-        val adult = settings.adultContent
         val preferAniList = settings.metadataPreference == MetadataPreference.ANILIST || !settings.mangabaka
         if (!preferAniList) {
-            safe("mangabaka search") { mangaBaka.search(query, limit, adult = adult) }?.takeIf { it.isNotEmpty() }?.let { return it }
+            safe("mangabaka search") { mangaBaka.search(query, limit) }?.takeIf { it.isNotEmpty() }?.let { return it }
         }
         if (settings.anilist) {
-            safe("anilist search") { aniList.search(query, limit, adult = adult) }?.let { return it }
+            safe("anilist search") { aniList.search(query, limit) }?.let { return it }
         }
         if (preferAniList && settings.mangabaka) {
-            safe("mangabaka search") { mangaBaka.search(query, limit, adult = adult) }?.let { return it }
+            safe("mangabaka search") { mangaBaka.search(query, limit) }?.let { return it }
         }
         return emptyList()
     }
@@ -75,7 +74,7 @@ class MetadataResolver(
     suspend fun popular(page: Int, settings: AggregatorSettings): List<SeriesMetadata>? = when {
         settings.mangabaka && settings.metadataPreference != MetadataPreference.ANILIST ->
             // MangaBaka sorts by popularity *rank*: ascending = most popular first (verified against the live API).
-            safe("mangabaka popular") { mangaBaka.search("", limit = 30, page = page, sortBy = "popularity_asc", adult = settings.adultContent) }
+            safe("mangabaka popular") { mangaBaka.search("", limit = 30, page = page, sortBy = "popularity_asc") }
                 ?: if (settings.anilist) safe("anilist popular") { aniList.popular(page) } else null
         settings.anilist -> safe("anilist popular") { aniList.popular(page) }
         else -> null
@@ -88,7 +87,7 @@ class MetadataResolver(
     suspend fun browse(query: String, filters: CatalogFilters, page: Int, settings: AggregatorSettings, limit: Int = 30): List<SeriesMetadata>? {
         if (!settings.mangabaka) return null
         return safe("mangabaka browse") {
-            mangaBaka.search(query, limit = limit, page = page, sortBy = if (query.isBlank()) "popularity_asc" else null, adult = settings.adultContent, filters = filters)
+            mangaBaka.search(query, limit = limit, page = page, sortBy = if (query.isBlank()) "popularity_asc" else null, filters = filters)
         }
     }
 
@@ -111,6 +110,7 @@ class MetadataResolver(
             artists = first.artists.ifEmpty { second.artists },
             genres = (first.genres + second.genres).distinctBy { it.lowercase() },
             covers = (first.covers + second.covers).distinctBy { it.url },
+            adult = first.adult || second.adult,
         )
     }
 

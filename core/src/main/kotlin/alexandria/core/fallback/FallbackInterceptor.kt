@@ -58,7 +58,8 @@ class FallbackInterceptor(
                 runBlocking { gate.withPermit { resolver.alternatePages(chapterRef, alt, s) } }
             }.getOrNull() ?: continue
             if (pages.size != resolution.pages.size) continue // cannot map page indices safely
-            val page = pages.getOrNull(index) ?: continue
+            val listed = pages.getOrNull(index) ?: continue
+            val page = runCatching { runBlocking { resolver.image(alt.sourceId, listed, s) } }.getOrNull() ?: continue
             val url = page.imageUrl.toHttpUrlOrNull() ?: continue
             val altRequest = request.newBuilder().url(url).apply {
                 page.headers.forEach { (k, v) -> header(k, v) }

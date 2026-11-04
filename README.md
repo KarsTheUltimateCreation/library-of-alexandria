@@ -30,20 +30,27 @@ Requires an app supporting extension lib **1.6** (Mihon 0.21+, Tachimanga 4.16+)
 
 | Feature | How |
 |---|---|
-| Multi-source search | MangaBaka (or AniList) + every enabled provider in parallel, bounded concurrency and timeouts |
+| Multi-source search | MangaBaka (or AniList) + every enabled provider in parallel; the results page never waits more than 6 s for a provider |
+| Speed | Timeouts adapt to each provider's measured latency; a failing provider cools down (2 → 30 min) instead of timing out on every call; only providers that could carry a series are searched to link it; identical concurrent requests are merged |
 | Series identification | Shared database ids (AniList / MAL / MangaUpdates / MangaDex) first, then all title variants (English, romanized, native, alternatives) with edition guards: *"Solo Leveling Novel"*, *"(Volume Version)"*, sequels and doujinshi are never merged with the main work |
 | Chapter aggregation | One entry per series; chapters from all linked providers merged and ordered |
 | Deduplication | Structured chapter identities: `10`, `10.1`, `10.10`, `10 Part 1`, `10 Extra`, `S2 Ch 10`, volume-reset numbering are all distinct; `Ch. 010`, `Episode 10`, `Chapter 10 [English]`, `Chapter 10 - Reupload` are the same. Alternatives are never discarded |
 | Missing chapters | Chapters absent from one provider are filled from another; gaps no provider fills are reported as *possible*, chapters beyond the translated range as *likely untranslated* — nothing is invented |
 | Per-chapter quality | Top candidates' page lists and a few image headers (48 KB range requests) are compared: completeness first, then resolution/compression, reliability, preference |
 | Fallback | A failing provider → next release; a failing page image → same page from another release with the same page count |
-| Covers | MangaBaka raw art (known dimensions), MangaDex original uploads, AniList, provider thumbnails — scored by resolution, bytes/pixel (catches upscales and over-compression), aspect, authenticity, original-language edition; fallback to the next candidate if loading fails |
+| Covers | MangaBaka raw art (known dimensions), AniList, provider thumbnails — scored by resolution, bytes/pixel (catches upscales and over-compression), aspect, authenticity, original-language edition; fallback to the next candidate if loading fails |
 | Metadata | MangaBaka and AniList (titles, status, original chapter count, ids), cached, rate-limited, optional |
 
-English only. Bundled providers: **MangaDex** (API, English chapters only), **WeebCentral**, **MangaPill**,
-**MangaKatana**, **MangaRead**, **mgeko** (mostly manhwa/manhua) and **Atsumaru** (API, several
-scanlation groups per chapter). With **18+ content** enabled: **Hiperdex**, **Omega Scans** and **ManhwaRead**
-(adult manhwa; ManhwaRead sits behind Cloudflare and needs the app to solve the challenge).
+English only, 18+ content included. Bundled providers:
+
+- **Series:** MangaDex (API, English chapters only; used for chapters, never for covers or standalone results),
+  WeebCentral, MangaPill, MangaKatana, MangaRead, mgeko (mostly manhwa/manhua) and Atsumaru (API, several
+  scanlation groups per chapter).
+- **Adult series:** Hiperdex, Omega Scans, ManhwaRead, Hentai20 and Hentai2Read — searched to link a series only
+  when it is adult content. ManhwaRead and Hentai2Read sit behind Cloudflare and need the app to solve the challenge.
+- **Galleries** (doujinshi, one-shots): NHentai, Hitomi, E-Hentai and Pururin — English galleries only, shown as
+  their own search results (one chapter each), never searched to link catalogue series.
+
 See [Adding a provider](docs/ADDING_SOURCES.md).
 
 Search results are ordered by how well each title matches the query (exact titles first); provider hits that
@@ -55,16 +62,15 @@ untranslated range and metadata attribution.
 
 ## Settings
 
-All available in the extension's native settings (grouped by prefix, since extension settings have no
-categories):
+Ten settings, all optional. Deduplication, missing-chapter recovery, source fallback, timeouts, concurrency and
+caching are always on and tune themselves.
 
-- **Covers** – high-quality covers, cover provider, prefer original artwork, automatic cover fallback
-- **Quality** – quality optimization, mode (Best / Balanced / Data saver — uses MangaDex data-saver images), prefer original resolution, quality-based switching
-- **Chapters** – deduplication, missing-chapter recovery, source fallback, specials, alternative translations, prefer official, preferred source
-- **Metadata** – AniList, MangaBaka, preferred provider, completeness checking
-- **Content** – show 18+ content (pornographic titles in search/browse/filters, plus the adult providers); off by default
-- **Sources** – enabled providers, provider order, manual series links (`mb:3397 = weebcentral:<id>, mangapill:-`)
-- **Performance** – concurrency, timeout, metadata cache duration, cover cache, clear cache
+- **High-quality covers**
+- **Reading quality** – Best / Balanced / Data saver / Fastest (first working source, no comparison)
+- **Preferred source**, **Special chapters**, **Separate translations**
+- **Metadata** – MangaBaka + AniList / MangaBaka only / AniList only; **Source report** in the description
+- **Sources** – enabled providers; **Manual series links** (`mb:3397 = weebcentral:<id>, mangapill:-`)
+- **Clear cache**
 
 Search also accepts identity keys directly: `mb:3397`, `al:105398`, `p:mangadex:<uuid>`.
 

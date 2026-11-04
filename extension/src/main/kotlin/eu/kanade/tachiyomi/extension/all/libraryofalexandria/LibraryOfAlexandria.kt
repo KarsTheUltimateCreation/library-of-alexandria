@@ -29,9 +29,10 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import eu.kanade.tachiyomi.source.online.HttpSource
-import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import okhttp3.Headers
 import okhttp3.OkHttpClient
@@ -109,7 +110,7 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
         return MangasPage(cards.map { it.toSManga() }, more)
     }
 
-    override fun getFilterList(): FilterList = Filters.list(runCatching { settings().adultContent }.getOrDefault(false))
+    override fun getFilterList(): FilterList = Filters.list()
 
     override suspend fun getSearchManga(page: Int, query: String, filters: FilterList): MangasPage {
         val catalogFilters = runCatching { Filters.parse(filters) }.getOrNull()
@@ -158,16 +159,18 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
         }
         writeMemo(newManga, update.state)
 
-        val newChapters = update.chapters?.map { c ->
+        val list = update.chapters
+        // Hosts write the whole chapter list in one SQL statement (SQLite caps it at 1 MB): the release memo is kept
+        // compact and shrinks with the chapter count. Chapters without one are resolved from the provider links.
+        val perChapter = list?.let { releasesPerChapter(it.size) } ?: 0
+        val newChapters = list?.map { c ->
             SChapter.create().apply {
                 url = c.url
                 name = c.name
                 chapter_number = c.number
                 date_upload = c.uploadedAt
                 scanlator = c.scanlator
-                runCatching {
-                    memo = buildJsonObject { put(MEMO_RELEASES, json.encodeToJsonElement(ListSerializer(Release.serializer()), c.releases)) }
-                }
+                if (perChapter > 0) runCatching { memo = buildJsonObject { put(MEMO_RELEASES, encodeReleases(c.releases, perChapter)) } }
             }
         } ?: chapters
         return SMangaUpdate(newManga, newChapters)
@@ -176,12 +179,12 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
     // ------------------------------------------------------------------ pages
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val releases = runCatching {
-            chapter.memo[MEMO_RELEASES]?.let { json.decodeFromJsonElement(ListSerializer(Release.serializer()), it) }
-        }.getOrNull()
-        val resolution = aggregator.pages(chapter.url, releases, settings())
-        return resolution.pages.map { Page(it.index, "", it.imageUrl) }
+        val resolution = aggregator.pages(chapter.url, decodeReleases(chapter), settings())
+        // Lazy pages (E-Hentai viewer pages) are resolved one at a time by the host through getImageUrl.
+        return resolution.pages.map { if (it.lazy) Page(it.index, it.imageUrl, null) else Page(it.index, "", it.imageUrl) }
     }
+
+    override suspend fun getImageUrl(page: Page): String = aggregator.resolveImage(page.url, settings())
 
     override fun imageRequest(page: Page): Request {
         val url = page.imageUrl ?: throw IllegalStateException("Page ${page.index} has no image URL")
@@ -202,9 +205,7 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
     }
 
     override fun getChapterUrl(chapter: SChapter): String {
-        val first = runCatching {
-            chapter.memo[MEMO_RELEASES]?.let { json.decodeFromJsonElement(ListSerializer(Release.serializer()), it) }?.firstOrNull()
-        }.getOrNull()
+        val first = decodeReleases(chapter)?.firstOrNull()
         if (first != null) {
             first.webUrl?.let { return it }
             aggregator.registry[first.sourceId]?.let { return it.seriesWebUrl(first.seriesId) }
@@ -217,7 +218,7 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         val registry = aggregator.registry
-        Settings.build(screen, preferences, registry.all.map { it.id to it.name }, registry.all.filter { it.adult }.map { it.id }.toSet()) { action ->
+        Settings.build(screen, preferences, registry.all.map { it.id to it.name }) { action ->
             when (action) {
                 Settings.Action.CLEAR_METADATA -> { aggregator.cache.clear("meta:"); aggregator.cache.clear("cover:") }
                 Settings.Action.CLEAR_LINKS -> { aggregator.cache.clear("state:"); aggregator.cache.clear("choice:") }
@@ -227,6 +228,25 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
     }
 
     // ------------------------------------------------------------------ memo helpers
+
+    /** Releases kept per chapter so the list's memos stay under [MEMO_BUDGET] characters (0 = none). */
+    private fun releasesPerChapter(chapters: Int): Int =
+        if (chapters == 0) 0 else (MEMO_BUDGET / (chapters * RELEASE_CHARS)).coerceIn(0, MAX_MEMO_RELEASES)
+
+    /** "sourceId<US>seriesId<US>chapterId" per release: all the reader needs to fetch pages. */
+    private fun encodeReleases(releases: List<Release>, max: Int) =
+        JsonArray(releases.take(max).map { JsonPrimitive(listOf(it.sourceId, it.seriesId, it.chapterId).joinToString(SEP)) })
+
+    /** Reads compact memos and, for chapters stored before 1.6.5, the full release objects. */
+    private fun decodeReleases(chapter: SChapter): List<Release>? = runCatching {
+        (chapter.memo[MEMO_RELEASES] as? JsonArray)?.mapNotNull { el ->
+            when (el) {
+                is JsonPrimitive -> el.content.split(SEP).takeIf { it.size == 3 }?.let { (sid, series, ch) -> Release(sid, series, ch, label = "", language = "en") }
+                is JsonObject -> json.decodeFromJsonElement(Release.serializer(), el)
+                else -> null
+            }
+        }?.takeIf { it.isNotEmpty() }
+    }.getOrNull()
 
     /** Provider links are kept in the manga memo so they survive cache clears and app reinstalls (Mihon persists memos). */
     private fun readMemo(manga: SManga): SeriesState? = runCatching {
@@ -257,5 +277,9 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
         private const val MEMO_STATE = "loa"
         private const val MEMO_RELEASES = "r"
         private const val DEFAULT_REFERER = "https://mangapill.com/"
+        private const val SEP = "\u001f"
+        private const val MEMO_BUDGET = 200_000
+        private const val RELEASE_CHARS = 80
+        private const val MAX_MEMO_RELEASES = 3
     }
 }

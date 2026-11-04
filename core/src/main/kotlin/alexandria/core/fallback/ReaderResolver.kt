@@ -157,6 +157,13 @@ class ReaderResolver(
         return fetchPages(release, settings)?.also { alternatePages[altKey(chapterRef, release)] = it }
     }
 
+    /** The actual image of [page] ([ReaderPage.lazy] pages are viewer pages that must be resolved first). */
+    suspend fun image(sourceId: String, page: ReaderPage, settings: AggregatorSettings): ReaderPage {
+        if (!page.lazy) return page
+        val adapter = registry[sourceId] ?: error("unknown source $sourceId")
+        return withTimeout(settings.requestTimeoutSeconds * 1000L) { adapter.resolveImage(page.imageUrl) }
+    }
+
     private fun remember(res: PageResolution): PageResolution {
         synchronized(recent) { recent[res.chapterRef] = res }
         if (res.notes.isNotEmpty()) log("chapter ${res.chapterRef}: ${res.chosen.sourceId} [${res.notes.joinToString("; ")}]")
@@ -171,7 +178,8 @@ class ReaderResolver(
         } catch (e: Exception) {
             return CandidateEvidence(r, null, emptyList(), error = e)
         }
-        if (pages.isEmpty()) return CandidateEvidence(r, pages, emptyList())
+        // Lazy pages (viewer pages, not images) cannot be probed without resolving them first.
+        if (pages.isEmpty() || pages.first().lazy) return CandidateEvidence(r, pages, emptyList())
         val indices = when (settings.qualityMode) {
             QualityMode.BEST -> listOf(0, pages.size / 2).distinct()
             QualityMode.BALANCED, QualityMode.DATA_SAVER -> listOf(0)
@@ -180,7 +188,7 @@ class ReaderResolver(
         val probes = indices.map { i ->
             val page = pages[i]
             try {
-                withTimeout(settings.requestTimeoutSeconds * 1000L) {
+                withTimeout(PROBE_TIMEOUT_MS) {
                     ImageProbe.probe(probeClient, page.imageUrl, page.headers.toHeaders(), maxBytes = 48 * 1024)
                 }.also { if (i == 0) reachable = true }
             } catch (e: CancellationException) {
@@ -206,7 +214,7 @@ class ReaderResolver(
         val chapter = SourceChapter(sourceId = r.sourceId, seriesId = r.seriesId, id = r.chapterId, label = r.label, language = r.language, webUrl = r.webUrl)
         val started = System.currentTimeMillis()
         return try {
-            withTimeout(settings.requestTimeoutSeconds * 1000L) {
+            withTimeout(registry.health.timeoutFor(r.sourceId, settings.requestTimeoutSeconds * 1000L)) {
                 adapter.pages(chapter, dataSaver = settings.qualityOptimization && settings.qualityMode == QualityMode.DATA_SAVER)
             }.also { registry.health.recordSuccess(r.sourceId, System.currentTimeMillis() - started) }
         } catch (e: Exception) {
@@ -217,4 +225,9 @@ class ReaderResolver(
     }
 
     private fun altKey(chapterRef: String, r: Release) = "$chapterRef|${r.sourceId}|${r.chapterId}"
+
+    private companion object {
+        /** A 48 KB header probe that takes longer than this says enough about the provider already. */
+        const val PROBE_TIMEOUT_MS = 8_000L
+    }
 }
