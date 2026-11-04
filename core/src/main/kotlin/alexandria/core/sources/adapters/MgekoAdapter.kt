@@ -23,6 +23,7 @@ class MgekoAdapter(ctx: AdapterContext, override val baseUrl: String = "https://
     override val name = "mgeko"
     override val languages: Set<String> = setOf("en")
     override val limiter: RateLimiter = RateLimiter.shared("mgeko", 2, 1_000)
+    override val specialties = setOf(alexandria.core.model.ContentKind.MANHWA, alexandria.core.model.ContentKind.MANHUA)
 
     override suspend fun search(query: String): List<SourceSeries> {
         val url = "$baseUrl/search/".toHttpUrl().newBuilder().addQueryParameter("search", searchTerm(query)).build()

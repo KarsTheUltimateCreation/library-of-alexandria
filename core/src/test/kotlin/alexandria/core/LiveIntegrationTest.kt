@@ -34,7 +34,13 @@ class LiveIntegrationTest {
         val cache = CacheManager(store)
         val health = ProviderHealth(store)
         lateinit var agg: Aggregator
-        val client = OkHttpClient.Builder()
+        // Host apps always give extensions a cookie jar; some providers (Hiperdex) need the session cookie.
+        val jar = object : okhttp3.CookieJar {
+            private val all = java.util.concurrent.CopyOnWriteArrayList<okhttp3.Cookie>()
+            override fun saveFromResponse(url: okhttp3.HttpUrl, cookies: List<okhttp3.Cookie>) { all += cookies }
+            override fun loadForRequest(url: okhttp3.HttpUrl) = all.filter { it.matches(url) }
+        }
+        val client = OkHttpClient.Builder().cookieJar(jar)
             .connectTimeout(20, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS)
             .addInterceptor(FallbackInterceptor({ agg.reader }, { settings }))
             .build()
@@ -53,8 +59,10 @@ class LiveIntegrationTest {
         live()
         val agg = aggregator()
         // mgeko carries mostly manhwa/manhua (no One Piece).
-        val queries = mapOf("mgeko" to "Omniscient Reader's Viewpoint")
-        for (adapter in agg.registry.all) {
+        val queries = mapOf("mgeko" to "Omniscient Reader's Viewpoint", "loa_asurascans" to "Overgeared", "loa_mangatown" to "Berserk")
+        // Adult and gallery providers do not carry these series (and two sit behind Cloudflare challenges); they are
+        // exercised through the unified-series tests instead.
+        for (adapter in agg.registry.all.filter { !it.adult && it.role == alexandria.core.sources.ProviderRole.SERIES }) {
             val query = queries[adapter.id] ?: "One Piece"
             val hits = adapter.search(query)
             println("${adapter.id}: ${hits.size} hits -> ${hits.take(3).map { it.title + " [" + it.id + "]" }}")
@@ -148,5 +156,24 @@ class LiveIntegrationTest {
         val provOnly = agg.search("Omniscient Reader", noMeta)
         println("provider-only search: " + provOnly.take(5).joinToString { "${it.title} <${it.key}>" })
         assertTrue(provOnly.all { it.key is SeriesKey.Provider })
+    }
+
+    @Test
+    fun `1_6_6 providers resolve pages and download an image`() = runBlocking {
+        live()
+        val agg = aggregator()
+        val client = OkHttpClient()
+        for ((id, query) in listOf("loa_asurascans" to "Overgeared", "loa_mangatown" to "Berserk")) {
+            val adapter = agg.registry[id]!!
+            val hit = adapter.search(query).first { it.title.equals(query, true) }
+            val chapters = adapter.chapters(adapter.details(hit), listOf("en"))
+            val c = chapters[chapters.size / 2]
+            val pages = adapter.pages(c, dataSaver = false)
+            val first = pages.first().let { if (it.lazy) adapter.resolveImage(it.imageUrl) else it }
+            val req = Request.Builder().url(first.imageUrl).apply { adapter.imageHeaders(first.imageUrl).forEach { (k, v) -> header(k, v) } }.build()
+            val (code, type, bytes) = client.newCall(req).execute().use { Triple(it.code, it.header("Content-Type"), it.body.bytes().size) }
+            println("$id: '${c.label}' n=${c.number} v=${c.volume} pages=${pages.size} lazy=${pages.first().lazy} image=$code $type ${bytes}B")
+            assertTrue(code == 200 && bytes > 10_000 && type?.startsWith("image/") == true, "$id image download failed: $code $type")
+        }
     }
 }

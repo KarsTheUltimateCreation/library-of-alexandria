@@ -47,6 +47,13 @@ artifact; anything else is labelled.
   `MangaLoaderContext` (cookies, JS evaluation, WebView) on the extension API, and (c) proving it runs in
   Tachimanga's JVM runtime. Since Tachimanga compatibility takes priority over source count, the portable
   adapter approach was chosen; the `SourceAdapter` interface is the integration point if that changes.
+- **Re-checked Nov 4 2026 (1.6.6):** `Nyora-Manga/nyora-mihon`, `nyora-mihon-extension-porter` and `nyora-shared`
+  still declare **no license** (GitHub API: `license: null`), so none of their code may be reused.
+  `Kotatsu-Redo/kotatsu-parsers-redo` (master `68f3fed`, Nov 1 2026; the parser revision Nyora pins) is **GPL-3.0**
+  and needs `org.json` and `androidx.collection` at runtime in addition to the host libraries, plus KSP-generated
+  code. Nyora's Mihon host relies on ActivityThread reflection, WebView user agents, Android bitmaps and a
+  Cloudflare interceptor located by class name. Decision (maintainer, Nov 4 2026): stay Apache-2.0 — no Kotatsu or
+  Nyora code is bundled. Coverage grows through portable adapters instead (Asura Scans, MangaTown in 1.6.6).
 - **Chosen: Approach C + E** — a small portable adapter interface (`SourceAdapter`) in a pure-JVM core,
   with provider logic adapted from maintained Keiyoushi sources. Only libraries every host already
   provides are used (OkHttp, Jsoup, kotlinx-serialization, coroutines).
@@ -121,9 +128,46 @@ since two probes cannot measure it more precisely.
 on the extension client retries a failed page with the same index from the next release *only when the
 page counts match*, and covers with the next candidate.
 
+**Timeouts, pacing and cancellation (1.6.6).** Every provider operation runs under an overall ceiling (20 s) and
+a `RequestBudget` in the coroutine context. Each network exchange gets its own timeout (adapted to the provider's
+measured latency, ≥ 6 s) that starts only when the request is actually sent and covers DNS, connect, headers *and*
+body (OkHttp call timeout); the body is read inside the call, so cancelling the coroutine cancels the socket read.
+Local waits — a rate-limit token, a service cool-down, one of the 4 concurrent slots per service — count as queue
+time: a wait the budget cannot cover fails at once, and a deadline spent purely queueing is not held against the
+provider's health. `Retry-After` (seconds or HTTP date) sets a process-wide cool-down for that service; a pause longer
+than the remaining budget (or 8 s without one) is not slept: the call fails fast so the caller falls back. Retries
+(transient errors only, at most 2) use randomised backoff and must fit the remaining budget. A provider exceeding
+its own deadline raises `ProviderTimeoutException`, an ordinary failure; only cancellation of the caller propagates.
+
+**Caching (1.6.6).** Each provider's chapter list is stored compactly (`StoredChapterList`) in its own preference
+file (≤ 48 lists, ≤ 150 k characters each; unchanged lists are not rewritten). Host-requested refreshes reuse a list
+fetched within the last minute (duplicate calls); internal rebuilds reuse lists up to 30 minutes old; failures and
+cool-downs fall back to the last known list. After a restart, page resolution rebuilds the full release list from
+the stored lists without network. Confirmed provider links have their own persisted budget (400 series). Chapter
+choices are cached under a fingerprint of every selection setting, so changing the preferred source or reading
+quality takes effect on the next opening. In-memory state (canonical chapters, alternate page lists, resolutions)
+is bounded; identical concurrent chapter-list and page-list fetches share one request.
+
+**Progressive discovery (1.6.6).** Linking a series searches, at first, only the three most promising unlinked
+providers (past hit rate, health, content-type specialty, user preference), and none when two are already linked.
+After building the chapter list, the remaining relevant providers are searched only if fewer than two linked
+providers contribute chapters, a linked provider failed with nothing cached, the metadata's chapter count exceeds
+what was found, or the completeness report shows possible gaps. *Search every source* searches all at once.
+Searched providers without a match are skipped for a week, as before.
+
 ## 4. Known limitations
 
 - Providers behind Cloudflare challenges or logins are not supported in the aggregation path.
 - Per-series source preferences are expressed as manual links in settings (no custom UI exists).
 - Translation accuracy is not assessed.
 - Page-level fallback cannot map pages between releases with different page counts.
+- Image recovery after the headers arrived needs the image to be read by the interceptor first (bounded to 12 MB);
+  it only happens on hosts that load images through the extension's client (verified in Mihon's source, **not
+  verified for Tachimanga**). Larger images stream as before and cannot be recovered mid-download.
+- Recovery alternatives are fetched with `runBlocking` on the OkHttp thread that loads the failing image; under
+  extreme saturation of the host's dispatcher a recovery waits for a free slot (bounded by provider timeouts).
+- The series preference (last comparison's ranking, reused 3 days) skips the comparison for later chapters of a
+  series; it is a speed trade-off and does not re-measure each chapter.
+- Service cool-downs are kept in memory only; after an app restart a service is asked again (and re-pauses on 429).
+- Asura Scans chapters with scrambled (tiled) pages and premium/early-access chapters are not readable from Asura;
+  other providers' releases serve them.

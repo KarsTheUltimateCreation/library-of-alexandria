@@ -143,4 +143,16 @@ class ChapterReconcilerTest {
         assertEquals(0, reconciler.reconcile(emptyMap(), settings).chapters.size)
         assertEquals(0, reconciler.reconcile(mapOf("a" to emptyList()), settings).chapters.size)
     }
+
+    @Test
+    fun `the provider with unusual numbering is demoted, not the well-aligned ones`() {
+        val titles = (1..20).associateWith { "Arc title number $it" }
+        fun aligned(id: String) = (1..20).map { ch(id, "Chapter $it", title = titles[it]) }
+        // "aa_new" sorts first; before 1.6.6 the alphabetically later ids ("mangadex", "zz") would have been demoted.
+        val outlier = (1..20).map { ch("aa_new", "Chapter ${it + 15}", title = titles[it]) }
+        val r = reconciler.reconcile(mapOf("aa_new" to outlier, "mangadex" to aligned("mangadex"), "zz" to aligned("zz")), settings)
+        assertTrue(r.numberingOffsets.all { it.first == "aa_new" }, "${r.numberingOffsets}")
+        val low = r.chapters.flatMap { it.releases }.filter { it.confidence < 0.8 }.map { it.sourceId }.toSet()
+        assertEquals(setOf("aa_new"), low)
+    }
 }

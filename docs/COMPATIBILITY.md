@@ -1,17 +1,16 @@
 # Compatibility and validation status
 
-Last updated for version **1.6.1**. This page separates what was actually tested from what is only
-expected to work. Nothing here is claimed as tested unless it was run.
+Last updated for version **1.6.6** (November 4, 2026). This page separates what was actually tested from what is
+only expected to work. Nothing here is claimed as tested unless it was run.
 
 ## Validation performed
 
 | Level | What | Result |
 |---|---|---|
-| Unit tests (offline) | 107 tests (plus 4 opt-in live tests): chapter parsing/identities, reconciliation, gap analysis, series matching, cover and chapter quality scoring, image header parsing, cache, rate limiting, circuit breaker and cool-down growth, adaptive timeouts, provider selection for linking, gallery title cleanup, Hitomi image URLs, fallback interceptor (MockWebServer), offline end-to-end aggregation with fake providers (failures, timeouts, disabled providers, fallback on/off, dedupe on/off, recovery on/off, manual links, memo-less hosts) | **Pass** |
-| Live integration (JVM) | 4 tests against the real MangaDex, WeebCentral, MangaPill, MangaKatana, MangaRead, mgeko, Atsumaru, MangaBaka and AniList: search → details → chapters → pages per provider; unified *Solo Leveling* (MangaBaka identity, 6 providers, 205 chapters, image download through the fallback interceptor, memo-less page resolution); *Berserk* across 6 providers (449 chapters, per-chapter comparison in all three quality modes); AniList-only and provider-only modes | **Pass** (Nov 3 2026; third-party sites can change) |
-| Build validation | APK assembles; dex contains only `alexandria.*` and the extension package (no bundled stdlib/OkHttp/Jsoup/serialization/extensions-lib); manifest has `tachiyomi.extension` feature, lib `1.6`, FQN class, nsfw/content-warning; versionCode 106001; JAR contains JVM classes + manifest + resources | **Pass** |
-| Repository index | `publish_repo.py` protobuf codec re-encodes Keiyoushi's live `index.json` (1,454 extensions) byte-identically to their `index.pb` | **Pass** |
-| Emulator (Mihon) | Mihon v0.21.3 on an Android 15 arm64 emulator — details below | **Pass** (except where noted) |
+| Unit tests (offline) | 158 tests (plus 5 opt-in live tests). 1.6.6 adds regression tests for: provider timeouts in cold, cached and parallel selection; caller cancellation and enclosing deadlines; `Retry-After` in seconds and all three HTTP-date forms; shared service cool-downs; budget-bounded jittered retries; queue time not counted as provider failure; stalled and cancelled body reads; chapter-list freshness (routine vs explicit), persistence across restarts, write-on-change; outage reporting; duplicate in-flight merging; truncated memos merged with full release lists; memo confidence; settings-sensitive choice caching; image recovery after headers; progressive discovery (initial set, gap- and failure-driven widening, thorough mode, weekly misses, specialty ordering); numbering-offset outlier choice; Asura Scans and MangaTown parsing | **Pass** (stable under CPU load; the previously flaky aggregation tests were made deterministic) |
+| Live integration (JVM) | 5 tests against the real services, including Asura Scans and MangaTown search → details → chapters → pages → image download | **Pass** (Nov 4 2026; third-party sites can change) |
+| Build validation | APK (versionCode 106006, lib 1.6) and JVM JAR assemble. JAR inspected: only `alexandria.*` and the extension package (no kotlin/kotlinx/OkHttp/Okio/Jsoup/extensions-lib/Injekt classes); Java 17 bytecode (AGP's generated `R` classes: Java 8); every referenced non-JDK package is host-provided (`jdeps`); no new runtime dependency. The JAR alone, with only the host libraries on the classpath, searched, listed chapters and fetched pages live (Asura Scans, MangaTown, WeebCentral) | **Pass** (local build is unsigned: no release key outside CI) |
+| Emulator (Mihon) | Mihon v0.21.3 on an Android 15 arm64 emulator — performed for **1.6.1** only, details below | **Not repeated for 1.6.6** |
 | Physical device | — | **Not tested** |
 | Tachimanga (iOS) | — | **Not tested** (no iOS device/simulator runtime available; Tachimanga is closed source) |
 
@@ -54,9 +53,30 @@ Target: Tachimanga **4.16+** (extension lib 1.6 support per its changelog). The 
 | Lib 1.6 suspend API | Supported since 4.16 per changelog | — |
 | `SManga.memo` / `SChapter.memo` | Unknown | Provider links and releases are rebuilt from the extension's own cache / a chapter refresh |
 | Images loaded through the extension's OkHttp client | Unknown | Page-level and cover-level fallback silently do nothing; chapter-level fallback (in `getPageList`) still works |
-| `getSharedPreferences("source_<id>_cache")` | Expected (standard API) | Falls back to an in-memory cache |
+| `getSharedPreferences("source_<id>_cache")`, `("source_<id>_chapters")` | Expected (standard API) | Falls back to an in-memory cache: links and chapter lists are not kept across restarts, so the first opening after a restart refetches them |
+| Image loading after the headers (body stalls / breaks off) | Recovered only if images go through the extension client | The host shows its own image error; *retry* in the reader asks again |
 | Preference widgets | Switch / List / MultiSelect / EditText are standard extension widgets | — |
 | `OnPreferenceChangeListener` (clear-cache action) | Unknown | The action may not run; use the app's own "clear data" instead |
+
+### Device checklist (1.6.6, Tachimanga on iPhone)
+
+Record the Tachimanga version and iOS version first. Each line names what to observe; "pass" means seen on the device.
+
+1. **Install** – add the repository (or the JAR), install *Library of Alexandria 1.6.6*, open its settings: all eleven
+   settings render, including *Search every source*.
+2. **Search** – search "solo leveling": one unified entry; sequels, editions and doujinshi separate; results within ~6 s.
+3. **Chapters** – open the entry: chapter list appears; description lists linked sources (should include several).
+   Pull to refresh twice within a minute: the second refresh is near-instant (reused lists).
+4. **Reading** – open a chapter and a later one; page images load; moving to the next chapter works.
+5. **Fallback** – with *Preferred source* set to a provider, open a chapter; switch Wi-Fi off and on mid-chapter or put
+   the device in Low Data Mode, then reopen: the chapter still opens (another release if needed), no endless spinner.
+6. **Settings changes** – change *Preferred source* or *Reading quality*, reopen an already-read chapter: it now comes
+   from the new choice (not the earlier cached one).
+7. **Restart persistence** – force-quit Tachimanga, relaunch with the device offline, open a library series: the chapter
+   list is still there (nothing removed). Back online, open a chapter without refreshing first: it opens without a
+   long delay.
+8. **New providers** – search "overgeared" (Asura Scans) and "berserk" (MangaTown); open a chapter from each
+   (MangaTown pages load one by one).
 
 Please report Tachimanga results in an issue so this table can be updated with facts.
 
@@ -64,6 +84,8 @@ Please report Tachimanga results in an issue so this table can be updated with f
 
 | Provider | Access | Notes |
 |---|---|---|
+| Asura Scans *(1.6.6, `loa_asurascans`)* | JSON API + Astro props | Manhwa/manhua group. Premium and early-access chapters are left out. Chapters whose pages are scrambled tiles fail on purpose (descrambling needs Android bitmaps), so another provider serves them; 17 of 18 sampled chapters across six popular series were plain (Nov 4 2026). Verified live. |
+| MangaTown *(1.6.6, `loa_mangatown`)* | HTML | Large general catalogue. Numbers and volumes come from chapter URLs. Paged chapters are resolved one viewer page at a time while reading (no per-chapter quality probe). Images need the site Referer. Its numbering sometimes differs from other providers (Berserk: +15); such releases are detected and used only as fallback. Verified live. |
 | MangaDex | Public API | Used for chapters only: its covers are not used and its unmatched search hits are not listed (its CDN serves a placeholder image to requests carrying another site's Referer). English chapters only; search and browse only return series that have English chapters. Licensed series often have none; chapters listed but missing on MangaDex@Home are excluded or fall back. Data-saver images used in Data Saver mode. |
 | WeebCentral | HTML | 1 request / 2 s (same pacing as the Keiyoushi extension). Tracker links give AniList/MangaUpdates ids. |
 | MangaPill | HTML | No alternative titles on detail pages (only on search cards). Images need the site Referer. |

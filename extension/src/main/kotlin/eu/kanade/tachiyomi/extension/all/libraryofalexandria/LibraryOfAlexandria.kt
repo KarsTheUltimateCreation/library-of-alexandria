@@ -2,16 +2,19 @@ package eu.kanade.tachiyomi.extension.all.libraryofalexandria
 
 import alexandria.core.Aggregator
 import alexandria.core.ChapterUrl
+import alexandria.core.Refresh
 import alexandria.core.SeriesCard
 import alexandria.core.SeriesKey
 import alexandria.core.SeriesState
 import alexandria.core.cache.CacheManager
+import alexandria.core.cache.ReleaseMemo
 import alexandria.core.config.AggregatorSettings
 import alexandria.core.fallback.FallbackInterceptor
 import alexandria.core.metadata.AniListClient
 import alexandria.core.metadata.MangaBakaClient
 import alexandria.core.metadata.MetadataResolver
 import alexandria.core.net.ImageHeaderInterceptor
+import alexandria.core.net.ServiceGate
 import alexandria.core.model.PublicationStatus
 import alexandria.core.ranking.ProviderHealth
 import alexandria.core.reconciliation.Release
@@ -61,10 +64,17 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
     }
 
     /** Cache lives in its own preference file so it never bloats the user's settings (or their backups). */
-    private val store by lazy {
-        runCatching { SharedPrefsStore(Injekt.get<Application>().getSharedPreferences("source_${id}_cache", Context.MODE_PRIVATE)) }
+    private val store by lazy { prefsStore("source_${id}_cache") }
+
+    /**
+     * Last known provider chapter lists, in a third file: they are the largest entries, and keeping them apart means
+     * the small, frequently read cache above is never rewritten together with them. Bounded (entries and size).
+     */
+    private val listStore by lazy { prefsStore("source_${id}_chapters") }
+
+    private fun prefsStore(name: String): alexandria.core.cache.KeyValueStore =
+        runCatching { SharedPrefsStore(Injekt.get<Application>().getSharedPreferences(name, Context.MODE_PRIVATE)) }
             .getOrElse { alexandria.core.cache.InMemoryStore() }
-    }
 
     private fun settings(): AggregatorSettings = Settings.read(preferences, aggregator.registry.all.map { it.id })
 
@@ -90,12 +100,14 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
     @Volatile private var aggregatorOrNull: Aggregator? = null
 
     private val aggregator: Aggregator by lazy {
-        val cache = CacheManager(store, maxPersistedEntries = 250)
+        // Confirmed provider links get their own budget so cover and metadata churn never evicts them.
+        val cache = CacheManager(store, maxPersistedEntries = 250, groupLimits = mapOf("state:" to 400))
+        val lists = CacheManager(listStore, maxPersistedEntries = MAX_STORED_LISTS, maxPersistedChars = MAX_STORED_LIST_CHARS)
         val health = ProviderHealth(store)
         val ctx = AdapterContext(client, json, userAgent)
         val registry = SourceRegistry.defaults(ctx, health)
         val meta = MetadataResolver(MangaBakaClient(client, json, userAgent), AniListClient(client, json, userAgent), cache, log = ::log)
-        Aggregator(registry, meta, cache, client, log = ::log).also { aggregatorOrNull = it }
+        Aggregator(registry, meta, cache, client, log = ::log, listCache = lists).also { aggregatorOrNull = it }
     }
 
     // ------------------------------------------------------------------ browse
@@ -140,7 +152,8 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
         val key = SeriesKey.parse(manga.url) ?: throw IllegalArgumentException("Unrecognised Library of Alexandria entry: ${manga.url}")
         val known = readMemo(manga)
         val s = settings()
-        val update = aggregator.update(key, known, fetchDetails, fetchChapters, s)
+        // The host asked (library update, refresh, first open): fetch again, except lists fetched moments ago.
+        val update = aggregator.update(key, known, fetchDetails, fetchChapters, s, Refresh.EXPLICIT)
 
         val newManga = if (fetchDetails) {
             SManga.create().apply {
@@ -163,7 +176,7 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
         // Hosts write the whole chapter list in one SQL statement (SQLite caps it at 1 MB): the release memo is kept
         // compact and shrinks with the chapter count. Chapters without one are resolved from the provider links.
         val perChapter = list?.let { releasesPerChapter(it.size) } ?: 0
-        val newChapters = list?.map { c ->
+        val fresh = list?.map { c ->
             SChapter.create().apply {
                 url = c.url
                 name = c.name
@@ -172,7 +185,19 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
                 scanlator = c.scanlator
                 if (perChapter > 0) runCatching { memo = buildJsonObject { put(MEMO_RELEASES, encodeReleases(c.releases, perChapter)) } }
             }
-        } ?: chapters
+        }
+        val newChapters = when {
+            fresh == null -> chapters
+            // A linked source is down and nothing of it was cached: its chapters are missing from this list only
+            // because of the outage. Keep the ones the host already has instead of letting it delete them.
+            update.unavailableSources.isNotEmpty() -> {
+                val urls = fresh.map { it.url }.toSet()
+                val kept = chapters.filter { it.url !in urls }
+                if (kept.isNotEmpty()) log("${key.value}: keeping ${kept.size} chapter(s) while ${update.unavailableSources.joinToString()} is unavailable")
+                (fresh + kept).sortedByDescending { it.chapter_number }
+            }
+            else -> fresh
+        }
         return SMangaUpdate(newManga, newChapters)
     }
 
@@ -221,8 +246,14 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
         Settings.build(screen, preferences, registry.all.map { it.id to it.name }) { action ->
             when (action) {
                 Settings.Action.CLEAR_METADATA -> { aggregator.cache.clear("meta:"); aggregator.cache.clear("cover:") }
-                Settings.Action.CLEAR_LINKS -> { aggregator.cache.clear("state:"); aggregator.cache.clear("choice:") }
-                Settings.Action.CLEAR_ALL -> { aggregator.cache.clear(); aggregator.registry.health.reset() }
+                Settings.Action.CLEAR_LINKS -> {
+                    aggregator.cache.clear("state:"); aggregator.cache.clear("choice:"); aggregator.cache.clear("seriespref:")
+                    aggregator.clearChapterLists()
+                }
+                Settings.Action.CLEAR_ALL -> {
+                    aggregator.cache.clear(); aggregator.clearChapterLists()
+                    aggregator.registry.health.reset(); ServiceGate.reset()
+                }
             }
         }
     }
@@ -233,15 +264,19 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
     private fun releasesPerChapter(chapters: Int): Int =
         if (chapters == 0) 0 else (MEMO_BUDGET / (chapters * RELEASE_CHARS)).coerceIn(0, MAX_MEMO_RELEASES)
 
-    /** "sourceId<US>seriesId<US>chapterId" per release: all the reader needs to fetch pages. */
+    /**
+     * "sourceId<US>seriesId<US>chapterId<US>confidence%" per release ([ReleaseMemo]): what the reader needs to fetch
+     * pages after a restart, before the full release list is known again. It is a bootstrap, not the authority:
+     * page resolution merges it with the complete list whenever that is available.
+     */
     private fun encodeReleases(releases: List<Release>, max: Int) =
-        JsonArray(releases.take(max).map { JsonPrimitive(listOf(it.sourceId, it.seriesId, it.chapterId).joinToString(SEP)) })
+        JsonArray(releases.take(max).map { JsonPrimitive(ReleaseMemo.encode(it)) })
 
-    /** Reads compact memos and, for chapters stored before 1.6.5, the full release objects. */
+    /** Reads compact memos (1.6.5's without confidence, too) and, for chapters stored before 1.6.5, full release objects. */
     private fun decodeReleases(chapter: SChapter): List<Release>? = runCatching {
         (chapter.memo[MEMO_RELEASES] as? JsonArray)?.mapNotNull { el ->
             when (el) {
-                is JsonPrimitive -> el.content.split(SEP).takeIf { it.size == 3 }?.let { (sid, series, ch) -> Release(sid, series, ch, label = "", language = "en") }
+                is JsonPrimitive -> ReleaseMemo.decode(el.content)
                 is JsonObject -> json.decodeFromJsonElement(Release.serializer(), el)
                 else -> null
             }
@@ -277,9 +312,12 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
         private const val MEMO_STATE = "loa"
         private const val MEMO_RELEASES = "r"
         private const val DEFAULT_REFERER = "https://mangapill.com/"
-        private const val SEP = "\u001f"
         private const val MEMO_BUDGET = 200_000
-        private const val RELEASE_CHARS = 80
+        private const val RELEASE_CHARS = 84
         private const val MAX_MEMO_RELEASES = 3
+
+        /** Provider chapter lists kept across restarts, and the largest one stored (≈1,500 chapters). */
+        private const val MAX_STORED_LISTS = 48
+        private const val MAX_STORED_LIST_CHARS = 150_000
     }
 }

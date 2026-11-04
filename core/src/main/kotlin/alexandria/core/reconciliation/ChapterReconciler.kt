@@ -216,7 +216,13 @@ class ChapterReconciler {
                 result += Triple(ids[j], ids[i], best.key)
             }
         }
-        return result
+        // Which side of a pair is "offset" must not depend on id order: the outlier is the provider that disagrees
+        // with more of the others. (Before 1.6.6 the alphabetically later id was demoted, so one new provider with
+        // unusual numbering could demote several well-aligned ones.) Ties keep the previous choice.
+        val involvement = result.flatMap { listOf(it.first, it.second) }.groupingBy { it }.eachCount()
+        return result.map { (a, b, offset) ->
+            if ((involvement[b] ?: 0) > (involvement[a] ?: 0)) Triple(b, a, -offset) else Triple(a, b, offset)
+        }
     }
 
     private fun titlesConflict(titles: List<String>): Boolean {

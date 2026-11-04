@@ -23,6 +23,8 @@ class SourceRanker(private val health: ProviderHealth) {
         s += 20 * health.get(r.sourceId).successRate
         s += 30 * r.confidence
         if (health.isCircuitOpen(r.sourceId)) s -= 50
+        // The service asked us to pause (429/503 + Retry-After): its requests would fail fast without being sent.
+        if (alexandria.core.net.ServiceGate.isCoolingDown(r.sourceId)) s -= 40
         return s
     }
 

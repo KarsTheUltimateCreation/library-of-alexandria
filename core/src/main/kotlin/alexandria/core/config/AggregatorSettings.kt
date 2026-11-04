@@ -47,6 +47,11 @@ data class AggregatorSettings(
     val enabledSources: Set<String> = emptySet(),
     /** Manual links: canonical series key -> list of "sourceId:seriesId" (or "sourceId:-" to unlink). */
     val manualLinks: Map<String, List<String>> = emptyMap(),
+    /**
+     * Search every relevant provider when linking a series (the user asked for thorough discovery). Off: the most
+     * promising healthy providers are searched first and the rest only when coverage is missing or sources fail.
+     */
+    val deepDiscovery: Boolean = false,
 
     // Performance (not user-facing: timeouts adapt to each provider's measured latency, see ProviderHealth)
     val maxConcurrentSearches: Int = 6,
@@ -70,7 +75,20 @@ data class AggregatorSettings(
 
     fun acceptsLanguage(language: String): Boolean = languages.isEmpty() || languageRank(language) != Int.MAX_VALUE
 
+    /**
+     * Identifies every input of per-chapter source selection. Cached chapter choices and series preferences are
+     * stored under it, so changing the preferred source, reading quality, provider order or enabled providers
+     * makes the next opening choose again instead of reusing a decision made under other settings.
+     */
+    fun selectionFingerprint(): String = listOf(
+        SELECTION_VERSION, preferredSource, qualityOptimization, qualitySwitching, qualityMode, preferOriginalResolution,
+        preferOfficial, sourceOrder, enabledSources.sorted(), languages,
+    ).joinToString("|").let { Integer.toHexString(it.hashCode()) }
+
     companion object {
+        /** Bump when the selection algorithm changes so decisions made by the old one are not reused. */
+        const val SELECTION_VERSION = 2
+
         /** Parses "mb:123 = mangadex:abc, weebcentral:-; al:5 = mangapill:12/x" style manual links. */
         fun parseManualLinks(text: String?): Map<String, List<String>> {
             if (text.isNullOrBlank()) return emptyMap()

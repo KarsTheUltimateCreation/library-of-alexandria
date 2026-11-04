@@ -22,7 +22,7 @@ project does not use. Credit the origin in a KDoc comment and in `NOTICE`.
 
 ```kotlin
 class ExampleAdapter(ctx: AdapterContext) : HtmlAdapter(ctx) {
-    override val id = "example"                 // [a-z0-9_]{2,32}; stored in users' data, never rename
+    override val id = "loa_example"             // [a-z0-9_]{2,32}; new ids use the "loa_" namespace; stored in users' data, never rename
     override val name = "Example"
     override val baseUrl = "https://example.org"
     override val languages = setOf("en")        // the extension is English-only
@@ -57,6 +57,13 @@ Guidelines:
 - Return per-image headers (`Referer`) through `imageHeaders()`; they are applied both for reading and
   for quality probes.
 - Throw on failure (HTTP errors become `HttpError`); the aggregator records provider health and falls back.
+- Make every request through `ctx.client.fetch` / `fetchText` with the provider's `limiter`. That is what applies the
+  shared pacing: rate limits, `Retry-After` cool-downs shared by all callers, per-request network timeouts, bounded
+  retries and cancellation while the body downloads. Calling `client.newCall(...)` directly bypasses all of it.
+- Set `specialties` when the site mostly carries one content type (e.g. manhwa); it only orders discovery.
+- Avoid features the portable core cannot provide on every host: Android `Bitmap` work (descrambling, merging),
+  WebView, JavaScript evaluation. If some chapters need them, throw for those chapters so fallback takes over
+  (see `AsuraScansAdapter`).
 
 ## 3. Register it
 

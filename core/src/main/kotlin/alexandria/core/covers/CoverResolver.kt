@@ -44,7 +44,13 @@ class CoverResolver(
             .sortedByDescending { it.coverOrigin.trust }
             .take(maxProbes)
         val probed: Map<String, ImageInfo?> = coroutineScope {
-            toProbe.map { c -> async { c.url to withTimeoutOrNull(5_000) { runCatching { probe(c) }.getOrNull() } } }.awaitAll().toMap()
+            toProbe.map { c ->
+                async {
+                    c.url to withTimeoutOrNull(5_000) {
+                        try { probe(c) } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { null }
+                    }
+                }
+            }.awaitAll().toMap()
         }
 
         val scored = unique.map { c ->

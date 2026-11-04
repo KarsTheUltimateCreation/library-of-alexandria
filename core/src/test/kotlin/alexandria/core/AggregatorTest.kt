@@ -15,6 +15,7 @@ import alexandria.core.net.HttpError
 import alexandria.core.ranking.ProviderHealth
 import alexandria.core.sources.SourceAdapter
 import alexandria.core.sources.SourceRegistry
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
@@ -71,7 +72,9 @@ class AggregatorTest {
         val client = OkHttpClient()
         val json = Json { ignoreUnknownKeys = true }
         val meta = MetadataResolver(MangaBakaClient(client, json, "t"), AniListClient(client, json, "t"), cache)
-        return Aggregator(SourceRegistry(adapters.toList(), ProviderHealth(store)), meta, cache, client)
+        // Detached search work runs unconfined so it shares the test's virtual clock (on Dispatchers.IO it raced the
+        // virtual 6 s search deadline and made these tests flaky under load).
+        return Aggregator(SourceRegistry(adapters.toList(), ProviderHealth(store)), meta, cache, client, detachedDispatcher = Dispatchers.Unconfined)
     }
 
     @Test
@@ -174,7 +177,7 @@ class AggregatorTest {
         val agg = aggregator(a)
         val key = agg.search("example", noMeta).first { it.title == "Example Series" }.key
         val ch = agg.update(key, null, false, true, noMeta).chapters!!.first()
-        val fresh = Aggregator(agg.registry, agg.metadata, agg.cache, OkHttpClient())
+        val fresh = Aggregator(agg.registry, agg.metadata, agg.cache, OkHttpClient(), detachedDispatcher = Dispatchers.Unconfined)
         assertEquals(10, fresh.pages(ch.url, null, noMeta).pages.size)
     }
 

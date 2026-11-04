@@ -6,8 +6,8 @@ This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 Third-party work
 ----------------
 * Provider parsing for WeebCentral, MangaPill, MangaKatana, MangaRead (Madara multisrc),
-  mgeko (MangaRawClub) and ManhwaRead, and the Atsumaru, Hiperdex (Hiper multisrc) and
-  Omega Scans (HeanCMS multisrc) API usage
+  mgeko (MangaRawClub), ManhwaRead and MangaTown, and the Atsumaru, Hiperdex (Hiper multisrc),
+  Omega Scans (HeanCMS multisrc) and Asura Scans API usage (including Asura's Astro prop decoding)
   (CSS selectors, request logic, request pacing), and the
   extension JAR packaging/signing approach in buildSrc/, are adapted from
   keiyoushi/extensions-source (https://github.com/keiyoushi/extensions-source),

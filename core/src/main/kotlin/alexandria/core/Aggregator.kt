@@ -1,6 +1,10 @@
 package alexandria.core
 
+import alexandria.core.cache.BoundedCache
 import alexandria.core.cache.CacheManager
+import alexandria.core.cache.SingleFlight
+import alexandria.core.cache.StoredChapterList
+import alexandria.core.cache.mergeReleases
 import alexandria.core.completeness.CompletenessAnalyzer
 import alexandria.core.completeness.CompletenessReport
 import alexandria.core.config.AggregatorSettings
@@ -20,7 +24,6 @@ import alexandria.core.model.PublicationStatus
 import alexandria.core.model.SeriesMetadata
 import alexandria.core.model.SourceChapter
 import alexandria.core.model.SourceSeries
-import alexandria.core.net.classify
 import alexandria.core.normalization.ChapterKind
 import alexandria.core.normalization.SearchRelevance
 import alexandria.core.normalization.TitleNormalizer
@@ -35,6 +38,7 @@ import alexandria.core.sources.SourceAdapter
 import alexandria.core.sources.SourceRegistry
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -45,10 +49,11 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
-import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.MapSerializer
+import kotlinx.serialization.builtins.serializer
 import okhttp3.Headers.Companion.toHeaders
 import okhttp3.OkHttpClient
 import java.util.concurrent.ConcurrentHashMap
@@ -90,7 +95,26 @@ data class SeriesDetails(
     val webUrl: String?,
 )
 
-data class SeriesUpdate(val details: SeriesDetails, val chapters: List<ChapterEntry>?, val state: SeriesState, val report: CompletenessReport?)
+data class SeriesUpdate(
+    val details: SeriesDetails,
+    val chapters: List<ChapterEntry>?,
+    val state: SeriesState,
+    val report: CompletenessReport?,
+    /**
+     * Linked providers whose chapter list could not be fetched and had no last known copy. Their chapters are
+     * missing from [chapters]; hosts should keep the chapters they already have rather than delete them.
+     */
+    val unavailableSources: Set<String> = emptySet(),
+)
+
+/** Why chapter lists are being built: decides how fresh a cached provider list must be to be reused. */
+enum class Refresh {
+    /** Internal rebuilds (resolving pages after a restart, re-opening): lists up to `chapterCacheMinutes` old are reused. */
+    ROUTINE,
+
+    /** The host asked (library update, pull to refresh): only lists fetched moments ago are reused (duplicate calls). */
+    EXPLICIT,
+}
 
 /**
  * Entry point used by the host-facing extension class. Everything here is host-agnostic, so it can be unit
@@ -104,6 +128,10 @@ class Aggregator(
     private val identity: IdentityResolver = IdentityResolver(),
     private val log: (String) -> Unit = {},
     private val clock: () -> Long = System::currentTimeMillis,
+    /** Persisted last known chapter list per provider series (bounded). Defaults to [cache]. */
+    private val listCache: CacheManager = cache,
+    /** Runs optional provider work that must never delay its caller (late search results). */
+    detachedDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
     private val reconciler = ChapterReconciler()
     private val completeness = CompletenessAnalyzer()
@@ -112,8 +140,9 @@ class Aggregator(
     val reader = ReaderResolver(registry, ranker, analyzer, cache, probeClient, log)
     private val covers = CoverResolver(probe = { c -> ImageProbe.probe(probeClient, c.url, c.headers.toHeaders()) })
 
-    /** Canonical chapters per series kept in memory for page resolution on hosts that do not persist memos. */
-    private val canonical = ConcurrentHashMap<String, Map<String, CanonicalChapter>>()
+    /** Canonical chapters per series kept in memory for page resolution (bounded: long sessions browse many series). */
+    private val canonical = BoundedCache<String, Map<String, CanonicalChapter>>(CANONICAL_SERIES)
+    private val chapterFlights = SingleFlight<String, List<SourceChapter>?>()
 
     // ---------------------------------------------------------------- search
 
@@ -217,11 +246,12 @@ class Aggregator(
         fetchDetails: Boolean,
         fetchChapters: Boolean,
         settings: AggregatorSettings,
+        intent: Refresh = Refresh.EXPLICIT,
     ): SeriesUpdate {
         val flightKey = "${key.value}|$fetchDetails|$fetchChapters"
-        val mine = CompletableDeferred<SeriesUpdate>()
-        inflight.putIfAbsent(flightKey, mine)?.let { running ->
-            // Join the identical request already running instead of repeating every network call.
+        // Join an identical request, or one doing strictly more (details + chapters covers chapters only).
+        val covering = listOf(flightKey, "${key.value}|true|$fetchChapters", "${key.value}|$fetchDetails|true", "${key.value}|true|true")
+        covering.firstNotNullOfOrNull { inflight[it] }?.let { running ->
             try {
                 return running.await()
             } catch (e: CancellationException) {
@@ -229,10 +259,16 @@ class Aggregator(
             } catch (e: Exception) {
                 // The other caller failed; try once on our own below.
             }
-            return updateNow(key, knownState, fetchDetails, fetchChapters, settings)
+        }
+        val mine = CompletableDeferred<SeriesUpdate>()
+        inflight.putIfAbsent(flightKey, mine)?.let { running ->
+            return try { running.await() } catch (e: CancellationException) {
+                currentCoroutineContext().ensureActive()
+                updateNow(key, knownState, fetchDetails, fetchChapters, settings, intent)
+            }
         }
         return try {
-            updateNow(key, knownState, fetchDetails, fetchChapters, settings).also { mine.complete(it) }
+            updateNow(key, knownState, fetchDetails, fetchChapters, settings, intent).also { mine.complete(it) }
         } catch (e: Throwable) {
             mine.completeExceptionally(e)
             throw e
@@ -247,6 +283,7 @@ class Aggregator(
         fetchDetails: Boolean,
         fetchChapters: Boolean,
         settings: AggregatorSettings,
+        intent: Refresh,
     ): SeriesUpdate {
         var state = loadState(key, knownState)
 
@@ -261,40 +298,94 @@ class Aggregator(
         }
         val meta = state.metadata
 
-        // 2. Link providers.
-        if (meta != null) state = resolveBindings(key, meta, state, settings)
+        // 2. Link providers: the most promising ones first (see resolveBindings), unless asked to be thorough.
+        if (meta != null) state = resolveBindings(key, meta, state, settings, deep = settings.deepDiscovery)
         saveState(state)
 
         // 3 + 4. Chapters and cover are independent: fetch them concurrently.
-        val finalState = state
-        val (built, cover) = coroutineScope {
-            val chaptersD = async { if (fetchChapters) buildChapters(key, finalState, settings) else null }
-            val coverD = async { if (fetchDetails) resolveCover(key, finalState, settings) else null }
+        val linkedState = state
+        var (built, cover) = coroutineScope {
+            val chaptersD = async { if (fetchChapters) buildChapters(key, linkedState, settings, intent) else null }
+            val coverD = async { if (fetchDetails) resolveCover(key, linkedState, settings) else null }
             chaptersD.await() to coverD.await()
+        }
+
+        // 5. Progressive discovery: search the remaining providers only when the linked ones leave chapters missing,
+        //    fail, or are too few to fall back on. Only for host-requested updates: an internal rebuild (resolving the
+        //    pages of a chapter being opened) must not wait for searches.
+        if (intent == Refresh.EXPLICIT && built != null && meta != null && !isGallery(key) && !settings.deepDiscovery &&
+            needsMoreCoverage(state, built, meta, settings)
+        ) {
+            val wider = resolveBindings(key, meta, state, settings, deep = true)
+            if (wider != state) {
+                val added = wider.bindings.keys - state.bindings.keys
+                state = wider
+                saveState(state)
+                if (added.isNotEmpty()) {
+                    log("coverage for ${key.value}: linked ${added.joinToString()} after a wider search")
+                    // Lists fetched a moment ago are reused; only the newly linked providers are asked.
+                    built = buildChapters(key, state, settings, Refresh.ROUTINE)
+                }
+            }
         }
         built?.let { canonical[key.value] = it.canonical.associateBy { c -> c.key } }
         val details = buildDetails(state, cover, built?.report, settings)
-        return SeriesUpdate(details, built?.entries, state, built?.report)
+        return SeriesUpdate(details, built?.entries, state, built?.report, built?.unavailable.orEmpty())
     }
 
-    private data class Built(val entries: List<ChapterEntry>, val report: CompletenessReport?, val canonical: List<CanonicalChapter>)
+    private data class Built(
+        val entries: List<ChapterEntry>,
+        val report: CompletenessReport?,
+        val canonical: List<CanonicalChapter>,
+        /** Linked providers with no chapter list at all (failed, nothing cached). */
+        val unavailable: Set<String>,
+        /** Linked providers that contributed chapters. */
+        val contributing: Set<String>,
+    )
 
-    private suspend fun buildChapters(key: SeriesKey, state: SeriesState, settings: AggregatorSettings): Built = coroutineScope {
+    /** Linked series providers that could still be searched for this series (not bound, not recently missed). */
+    private fun discoverable(state: SeriesState, meta: SeriesMetadata, settings: AggregatorSettings): List<SourceAdapter> {
+        val now = clock()
+        val adultSeries = meta.looksAdult || state.bindings.keys.any { registry[it]?.adult == true }
+        return registry.forLinking(settings, adultSeries).filter { a ->
+            a.id !in state.bindings && (state.misses[a.id]?.let { now - it > MISS_TTL } ?: true)
+        }
+    }
+
+    private fun needsMoreCoverage(state: SeriesState, built: Built, meta: SeriesMetadata, settings: AggregatorSettings): Boolean {
+        if (discoverable(state, meta, settings).isEmpty()) return false
+        if (built.contributing.size < TARGET_LINKED) return true // nothing, or nothing to fall back on
+        if (built.unavailable.isNotEmpty()) return true // a linked source is failing
+        val main = built.canonical.filter { it.identity.kind == ChapterKind.MAIN }.mapNotNull { it.identity.number?.whole?.toDouble() }
+        val total = meta.totalChapters?.trim()?.toDoubleOrNull()
+        if (total != null && total > 0 && (main.maxOrNull() ?: 0.0) < total) return true // the run continues past what we have
+        return built.report?.gaps?.any { it.type == alexandria.core.completeness.GapType.POSSIBLE_MISSING } == true
+    }
+
+    private suspend fun buildChapters(key: SeriesKey, state: SeriesState, settings: AggregatorSettings, intent: Refresh): Built = coroutineScope {
         val enabled = registry.enabled(settings).map { it.id }.toSet()
         val bound = state.bindings.filterKeys { it in enabled }
         val gate = Semaphore(settings.maxConcurrentSearches.coerceIn(1, 6))
+        val freshFor = if (intent == Refresh.ROUTINE) settings.chapterCacheMinutes * CacheManager.MINUTE else EXPLICIT_REUSE_MS
+        val unavailable = ConcurrentHashMap.newKeySet<String>()
         val lists = bound.map { (sid, b) ->
             async {
                 val adapter = registry[sid] ?: return@async sid to emptyList<SourceChapter>()
-                val cacheKey = "ch:$sid:${b.series.id}"
+                val cacheKey = listKey(sid, b.series.id)
+                // Fresh enough for this kind of request: no network call at all.
+                storedList(cacheKey, freshFor)?.let { return@async sid to it }
                 // A provider in cool-down would only time out again: use its last known list straight away.
-                val fresh = if (registry.health.isCircuitOpen(sid)) null else gate.withPermit { guarded(adapter, settings) { adapter.chapters(b.series, settings.languages) } }
-                if (fresh != null) {
-                    cache.put(cacheKey, ListSerializer(SourceChapter.serializer()), fresh, persist = false)
+                val fresh = if (registry.health.isCircuitOpen(sid)) null else chapterFlights.run(cacheKey) {
+                    gate.withPermit { guarded(adapter, settings) { adapter.chapters(b.series, settings.languages) } }
+                }
+                if (!fresh.isNullOrEmpty()) {
+                    listCache.put(cacheKey, StoredChapterList.serializer(), StoredChapterList.of(sid, b.series.id, fresh))
                     sid to fresh
                 } else {
-                    // Provider failed: keep its last known chapters so the list does not shrink.
-                    sid to (cache.get(cacheKey, ListSerializer(SourceChapter.serializer()), Long.MAX_VALUE) ?: emptyList())
+                    // Failed (or suddenly empty): keep the last known chapters so the list does not shrink.
+                    val last = storedList(cacheKey, Long.MAX_VALUE)
+                    if (last == null) unavailable += sid
+                    sid to last.orEmpty()
                 }
             }
         }.awaitAll().toMap().filterValues { it.isNotEmpty() }
@@ -330,7 +421,27 @@ class Aggregator(
                 releases = ranked,
             )
         }.asReversed() // hosts expect newest first
-        Built(entries, report, chapters)
+        Built(entries, report, chapters, unavailable.toSet(), lists.keys)
+    }
+
+    private fun listKey(sourceId: String, seriesId: String) = "chl:$sourceId:$seriesId"
+
+    private fun storedList(cacheKey: String, maxAgeMs: Long): List<SourceChapter>? =
+        listCache.get(cacheKey, StoredChapterList.serializer(), maxAgeMs)?.toChapters()
+
+    /**
+     * Canonical chapters rebuilt without network from the persisted provider links and last known lists, for page
+     * resolution after an app restart. Null when nothing usable is stored.
+     */
+    private fun offlineCanonical(key: SeriesKey, settings: AggregatorSettings): Map<String, CanonicalChapter>? {
+        canonical[key.value]?.let { return it }
+        val state = cache.get("state:${key.value}", SeriesState.serializer(), Long.MAX_VALUE) ?: return null
+        val enabled = registry.enabled(settings).map { it.id }.toSet()
+        val lists = state.bindings.filterKeys { it in enabled }
+            .mapNotNull { (sid, b) -> storedList(listKey(sid, b.series.id), Long.MAX_VALUE)?.let { sid to it } }
+            .toMap()
+        if (lists.isEmpty()) return null
+        return reconciler.reconcile(lists, settings).chapters.associateBy { it.key }.also { canonical[key.value] = it }
     }
 
     private fun primarySource(chapters: List<CanonicalChapter>, settings: AggregatorSettings): String? {
@@ -341,25 +452,32 @@ class Aggregator(
 
     // ---------------------------------------------------------------- pages
 
+    /**
+     * Resolves a chapter's pages. Releases come from the full canonical record (in memory, or rebuilt offline from
+     * the persisted lists) merged with the host's compact memo, which is only a bootstrap: it may be truncated and
+     * lacks titles. Only when neither is available are the provider lists fetched again.
+     */
     suspend fun pages(chapterUrl: String, memoReleases: List<Release>?, settings: AggregatorSettings): PageResolution {
         val (key, chapterKey) = ChapterUrl.parse(chapterUrl) ?: throw IllegalArgumentException("Not a Library of Alexandria chapter: $chapterUrl")
-        val releases = memoReleases?.takeIf { it.isNotEmpty() }
-            ?: canonical[key.value]?.get(chapterKey)?.releases
-            ?: run {
-                // Host did not keep our memo (or app restarted): rebuild from persisted provider links.
-                update(key, null, fetchDetails = false, fetchChapters = true, settings)
-                canonical[key.value]?.get(chapterKey)?.releases
-            }
+        val memo = memoReleases?.takeIf { it.isNotEmpty() }
+        var refreshed = false
+        suspend fun rebuild(intent: Refresh): List<Release>? {
+            refreshed = true
+            update(key, null, fetchDetails = false, fetchChapters = true, settings, intent)
+            return canonical[key.value]?.get(chapterKey)?.releases
+        }
+        val known = offlineCanonical(key, settings)?.get(chapterKey)?.releases
+        val releases = mergeReleases(known, memo).ifEmpty { null }
+            ?: rebuild(Refresh.ROUTINE) // nothing stored (memo-less host after a restart): rebuild from the provider links
             ?: throw IllegalStateException("Chapter is no longer listed by any enabled source. Refresh the series.")
         val ref = ChapterUrl.build(key, chapterKey)
         val resolution = try {
             reader.resolve(ref, releases, settings)
         } catch (e: NoReadableReleaseException) {
-            // Releases stored in the chapter memo may be stale (chapter re-uploaded, provider re-linked): refresh once.
-            if (memoReleases.isNullOrEmpty()) throw e
-            update(key, null, fetchDetails = false, fetchChapters = true, settings)
-            val fresh = canonical[key.value]?.get(chapterKey)?.releases ?: throw e
-            reader.resolve(ref, fresh, settings)
+            // Stored releases may be stale (chapter re-uploaded, provider re-linked): refresh the lists once.
+            if (refreshed) throw e
+            val fresh = rebuild(Refresh.EXPLICIT) ?: throw e
+            reader.resolve(ref, mergeReleases(fresh, memo), settings)
         }
         val pages = resolution.pages.map { p -> p.copy(imageUrl = FallbackInterceptor.tagPage(p.imageUrl, ref, p.index, resolution.chosen.sourceId)) }
         return resolution.copy(pages = pages)
@@ -372,13 +490,19 @@ class Aggregator(
     suspend fun resolveImage(pageRef: String, settings: AggregatorSettings): String {
         val token = FallbackInterceptor.pageToken(pageRef) ?: throw IllegalArgumentException("Not a Library of Alexandria page: $pageRef")
         val adapter = token.sourceId?.let { registry[it] } ?: throw IllegalStateException("Unknown provider for page $pageRef")
-        val page = withTimeout(settings.requestTimeoutSeconds * 1000L) { adapter.resolveImage(FallbackInterceptor.stripTag(pageRef)) }
+        val page = registry.health.call(adapter.id, settings.requestTimeoutSeconds * 1000L) { adapter.resolveImage(FallbackInterceptor.stripTag(pageRef)) }
         return FallbackInterceptor.tagPage(page.imageUrl, token.chapterRef, token.index, adapter.id)
     }
 
     // ---------------------------------------------------------------- binding
 
-    private suspend fun resolveBindings(key: SeriesKey, meta: SeriesMetadata, state0: SeriesState, settings: AggregatorSettings): SeriesState {
+    /**
+     * Links provider series to [key]. Manual links win; title-only links from search are verified with details.
+     * Unlinked providers are searched progressively: with [deep] false only when fewer than [TARGET_LINKED]
+     * providers are linked, and then only the [INITIAL_DISCOVERY] most promising ones (by past hit rate, health,
+     * content-type specialty and user order). [deep] searches every relevant provider not missed in the last week.
+     */
+    private suspend fun resolveBindings(key: SeriesKey, meta: SeriesMetadata, state0: SeriesState, settings: AggregatorSettings, deep: Boolean): SeriesState {
         var state = state0
         // Manual links from settings win over automatic matching.
         settings.manualLinks[key.value]?.forEach { target ->
@@ -419,10 +543,12 @@ class Aggregator(
         val now = clock()
         if (isGallery(key)) return state // other sites' copies were linked from search; series providers never carry it
         // Re-search providers that had no match weekly, not on every library refresh.
-        val missTtl = 7 * CacheManager.DAY
-        val adultSeries = meta.looksAdult || state.bindings.keys.any { registry[it]?.adult == true }
-        val toFind = registry.forLinking(settings, adultSeries).filter { a ->
-            a.id !in state.bindings && (state.misses[a.id]?.let { now - it > missTtl } ?: true)
+        val candidates = discoverable(state, meta, settings)
+        val linked = state.bindings.keys.count { registry[it] != null && (settings.enabledSources.isEmpty() || it in settings.enabledSources) }
+        val toFind = when {
+            deep -> candidates
+            linked >= TARGET_LINKED -> emptyList()
+            else -> discoveryOrder(candidates, meta, settings).take(INITIAL_DISCOVERY)
         }
         if (toFind.isEmpty()) return state
 
@@ -449,8 +575,39 @@ class Aggregator(
                 missed[adapter.id] = now
             }
         } }.awaitAll() }
+        recordDiscovery(toFind.filter { results.containsKey(it.id) }.map { it.id }, found.keys)
         return state.copy(bindings = state.bindings + found, misses = state.misses + missed)
     }
+
+    // ---------------------------------------------------------------- discovery statistics
+
+    /** Per provider: [0] = link searches, [1] = series found. Persisted, so the order improves across sessions. */
+    private val discoveryStats: MutableMap<String, List<Int>> by lazy {
+        ConcurrentHashMap(cache.get(DISCOVERY_KEY, DISCOVERY_SERIALIZER, Long.MAX_VALUE).orEmpty())
+    }
+
+    private fun recordDiscovery(searched: List<String>, found: Set<String>) {
+        if (searched.isEmpty()) return
+        searched.forEach { sid ->
+            val (n, hits) = discoveryStats[sid] ?: listOf(0, 0)
+            // Halve old counts now and then so a provider whose catalogue changed is re-evaluated.
+            val (n2, h2) = if (n >= 200) n / 2 to hits / 2 else n to hits
+            discoveryStats[sid] = listOf(n2 + 1, h2 + if (sid in found) 1 else 0)
+        }
+        cache.put(DISCOVERY_KEY, DISCOVERY_SERIALIZER, discoveryStats.toMap())
+    }
+
+    /** Most promising providers first: past hit rate, health, content-type specialty, user order. */
+    private fun discoveryOrder(candidates: List<SourceAdapter>, meta: SeriesMetadata, settings: AggregatorSettings): List<SourceAdapter> =
+        candidates.sortedByDescending { a ->
+            val (n, hits) = discoveryStats[a.id] ?: listOf(0, 0)
+            var score = (hits + 1.0) / (n + 2.0) // Laplace: new providers start at 0.5
+            score += 0.3 * registry.health.get(a.id).successRate
+            a.specialties?.let { sp -> if (meta.kind != ContentKind.UNKNOWN) score += if (meta.kind in sp) 0.2 else -0.25 }
+            if (settings.preferredSource == a.id) score += 1.0
+            score -= 0.02 * settings.sourceRank(a.id).coerceAtMost(10)
+            score
+        }
 
     private suspend fun searchProviders(
         queries: List<String>,
@@ -489,7 +646,7 @@ class Aggregator(
     }
 
     /** Scope for provider calls whose results are optional and must never delay the caller. */
-    private val detached = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val detached = CoroutineScope(SupervisorJob() + detachedDispatcher)
 
     private suspend fun providerAnchor(key: SeriesKey.Provider, state: SeriesState, settings: AggregatorSettings): SourceSeries? {
         val adapter = registry[key.sourceId] ?: return state.bindings[key.sourceId]?.series
@@ -638,9 +795,32 @@ class Aggregator(
         canonical.remove(key.value)
     }
 
+    /** Drops every in-memory chapter list and canonical record (after "clear cache"). */
+    fun clearChapterLists() {
+        listCache.clear("chl:")
+        cache.clear("ch:")
+        canonical.clear()
+    }
+
     private companion object {
         const val SEARCH_DEADLINE_MS = 6_000L
         const val BROWSE_PAGE_SIZE = 30
+
+        /** Host-requested refreshes reuse a provider list fetched within this window (duplicate calls). */
+        const val EXPLICIT_REUSE_MS = 60_000L
+
+        /** Linked providers wanted per series: one to read from, one to fall back on. */
+        const val TARGET_LINKED = 2
+
+        /** Providers searched in the first discovery round. */
+        const val INITIAL_DISCOVERY = 3
+
+        /** A provider without a match is searched again after this long. */
+        const val MISS_TTL = 7 * CacheManager.DAY
+
+        const val CANONICAL_SERIES = 64
+        const val DISCOVERY_KEY = "disc:stats"
+        val DISCOVERY_SERIALIZER = MapSerializer(String.serializer(), ListSerializer(Int.serializer()))
     }
 
     private fun isGallery(key: SeriesKey) = key is SeriesKey.Provider && registry[key.sourceId]?.role == ProviderRole.GALLERY
@@ -648,17 +828,16 @@ class Aggregator(
     private fun keyFor(m: SeriesMetadata): SeriesKey? =
         m.ids.mangabaka?.let { SeriesKey.MangaBaka(it) } ?: m.ids.anilist?.let { SeriesKey.AniList(it) }
 
-    private suspend fun <T> guarded(adapter: SourceAdapter, settings: AggregatorSettings, block: suspend () -> T): T? {
-        val started = clock()
-        return try {
-            withTimeout(registry.health.timeoutFor(adapter.id, settings.requestTimeoutSeconds * 1000L)) { block() }.also {
-                registry.health.recordSuccess(adapter.id, clock() - started)
-            }
-        } catch (e: Exception) {
-            if (e is CancellationException && e !is kotlinx.coroutines.TimeoutCancellationException) throw e
-            registry.health.recordFailure(adapter.id, classify(e))
-            log("${adapter.id} failed: ${e::class.simpleName}: ${e.message}")
-            null
-        }
+    /**
+     * One provider call with health tracking, an overall deadline and per-request network timeouts. Any failure of the
+     * provider (its own timeout included) yields null; cancellation of the caller propagates.
+     */
+    private suspend fun <T> guarded(adapter: SourceAdapter, settings: AggregatorSettings, block: suspend () -> T): T? = try {
+        registry.health.call(adapter.id, settings.requestTimeoutSeconds * 1000L) { block() }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        log("${adapter.id} failed: ${e::class.simpleName}: ${e.message}")
+        null
     }
 }

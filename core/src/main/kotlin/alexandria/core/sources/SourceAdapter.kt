@@ -57,6 +57,12 @@ interface SourceAdapter {
      */
     val imageHosts: Set<String> get() = emptySet()
 
+    /**
+     * Content types this provider mostly carries (null = general). Used only to order progressive discovery, so a
+     * manhwa-focused site is asked later for a Japanese manga; it never excludes the provider.
+     */
+    val specialties: Set<alexandria.core.model.ContentKind>? get() = null
+
     suspend fun search(query: String): List<SourceSeries>
 
     /** Fills alt titles / ids / status for a search hit. Default: unchanged. */

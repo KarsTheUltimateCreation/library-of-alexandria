@@ -25,16 +25,25 @@ class InMemoryStore : KeyValueStore {
 private data class Envelope(val t: Long, val v: String)
 
 /**
- * Two-level cache: an in-memory map in front of a persistent [KeyValueStore], with per-entry TTLs and a
- * bounded number of persisted entries (oldest evicted first) so the host's preference file stays small.
+ * Two-level cache: an in-memory map in front of a persistent [KeyValueStore], with per-entry TTLs and a bounded
+ * number of persisted entries (oldest evicted first) so the host's preference file stays small.
+ *
+ * [groupLimits] gives key prefixes their own persisted-entry budget (e.g. confirmed provider links), so churn in
+ * one kind of entry (covers, metadata) cannot evict another. Entries whose encoding exceeds [maxPersistedChars]
+ * stay in memory only. A value identical to the one persisted less than a day ago is not written again, which
+ * keeps library updates of unchanged series from rewriting the store.
  */
 class CacheManager(
     private val store: KeyValueStore,
     private val json: Json = DEFAULT_JSON,
     private val maxPersistedEntries: Int = 400,
     private val clock: () -> Long = System::currentTimeMillis,
+    private val groupLimits: Map<String, Int> = emptyMap(),
+    private val maxPersistedChars: Int = Int.MAX_VALUE,
 ) {
     private val memory = ConcurrentHashMap<String, Envelope>()
+    /** key -> (value hash, time) of the last write to [store] by this instance. */
+    private val persisted = ConcurrentHashMap<String, Pair<Int, Long>>()
 
     fun <T> get(key: String, serializer: KSerializer<T>, maxAgeMillis: Long): T? {
         val env = memory[key] ?: store.get(PREFIX + key)?.let { raw ->
@@ -45,23 +54,29 @@ class CacheManager(
     }
 
     fun <T> put(key: String, serializer: KSerializer<T>, value: T, persist: Boolean = true) {
-        val env = Envelope(clock(), json.encodeToString(serializer, value))
+        val now = clock()
+        val env = Envelope(now, json.encodeToString(serializer, value))
         memory[key] = env
         if (memory.size > maxPersistedEntries * 2) trimMemory()
-        if (persist) {
-            store.put(PREFIX + key, json.encodeToString(Envelope.serializer(), env))
-            evictIfNeeded()
-        }
+        if (!persist || env.v.length > maxPersistedChars) return
+        val hash = env.v.hashCode()
+        val last = persisted[key]
+        if (last != null && last.first == hash && now - last.second < DAY) return
+        store.put(PREFIX + key, json.encodeToString(Envelope.serializer(), env))
+        persisted[key] = hash to now
+        evictIfNeeded(key)
     }
 
     fun remove(key: String) {
         memory.remove(key)
+        persisted.remove(key)
         store.remove(PREFIX + key)
     }
 
     /** Removes entries whose key starts with [prefix] (or everything when null). */
     fun clear(prefix: String? = null) {
         memory.keys.filter { prefix == null || it.startsWith(prefix) }.forEach { memory.remove(it) }
+        persisted.keys.filter { prefix == null || it.startsWith(prefix) }.forEach { persisted.remove(it) }
         store.keys().filter { it.startsWith(PREFIX + (prefix ?: "")) }.forEach { store.remove(it) }
     }
 
@@ -71,13 +86,17 @@ class CacheManager(
         memory.entries.sortedBy { it.value.t }.take(memory.size - maxPersistedEntries).forEach { memory.remove(it.key) }
     }
 
-    private fun evictIfNeeded() {
-        val keys = store.keys().filter { it.startsWith(PREFIX) }
-        if (keys.size <= maxPersistedEntries) return
+    private fun groupOf(key: String): String? = groupLimits.keys.filter { key.startsWith(it) }.maxByOrNull { it.length }
+
+    private fun evictIfNeeded(justWritten: String) {
+        val group = groupOf(justWritten)
+        val limit = group?.let { groupLimits.getValue(it) } ?: maxPersistedEntries
+        val keys = store.keys().filter { it.startsWith(PREFIX) && groupOf(it.removePrefix(PREFIX)) == group }
+        if (keys.size <= limit) return
         keys.map { k -> k to (store.get(k)?.let { raw -> runCatching { json.decodeFromString(Envelope.serializer(), raw).t }.getOrNull() } ?: 0L) }
             .sortedBy { it.second }
-            .take(keys.size - maxPersistedEntries + maxPersistedEntries / 10)
-            .forEach { store.remove(it.first) }
+            .take(keys.size - limit + limit / 10)
+            .forEach { store.remove(it.first); persisted.remove(it.first.removePrefix(PREFIX)) }
     }
 
     companion object {

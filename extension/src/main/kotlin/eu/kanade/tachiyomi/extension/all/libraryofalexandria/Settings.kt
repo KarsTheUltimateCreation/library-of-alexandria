@@ -33,6 +33,7 @@ object Settings {
     /** Providers shipped before [KNOWN] was introduced (1.6.4). */
     private val LEGACY_SOURCES = setOf("mangadex", "weebcentral", "mangapill", "mangakatana", "mangaread", "mgeko", "atsumaru")
     private const val LINKS = "src_manual_links"
+    private const val DEEP = "src_deep_discovery"
     private const val CACHE_ACTION = "perf_cache_action"
     private const val NONE = "__none__"
 
@@ -64,6 +65,7 @@ object Settings {
             completenessChecking = b(COMPLETENESS, d.completenessChecking),
             enabledSources = enabledSources(p, allSources),
             manualLinks = AggregatorSettings.parseManualLinks(s(LINKS, "")),
+            deepDiscovery = b(DEEP, d.deepDiscovery),
         )
     }
 
@@ -167,6 +169,11 @@ object Settings {
                     true
                 }
             },
+        )
+        switch(
+            DEEP, "Search every source",
+            "Look for each series on all enabled sources when it is opened (slower). Off: the most promising sources first, the rest when chapters are missing or a source fails.",
+            false,
         )
         screen.addPreference(
             EditTextPreference(ctx).apply {

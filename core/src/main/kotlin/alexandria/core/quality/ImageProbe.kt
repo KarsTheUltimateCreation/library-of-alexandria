@@ -1,7 +1,7 @@
 package alexandria.core.quality
 
 import alexandria.core.net.HttpError
-import alexandria.core.net.awaitResponse
+import alexandria.core.net.exchange
 import okhttp3.Headers
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -25,8 +25,8 @@ object ImageProbe {
 
     suspend fun probe(client: OkHttpClient, url: String, headers: Headers = Headers.headersOf(), maxBytes: Int = DEFAULT_MAX_BYTES): ImageInfo? {
         val request = Request.Builder().url(url).headers(headers).header("Range", "bytes=0-${maxBytes - 1}").build()
-        val response = client.newCall(request).awaitResponse()
-        response.use { r ->
+        // Read inside the call so a cancelled or timed-out probe also stops a body that is still downloading.
+        return client.exchange(request) { r ->
             if (!r.isSuccessful) throw HttpError(r.code, url)
             val total = r.header("Content-Range")?.substringAfterLast('/')?.trim()?.toLongOrNull()
                 ?: if (r.code == 200) r.body.contentLength().takeIf { it > 0 } else null
@@ -38,8 +38,7 @@ object ImageProbe {
                 if (n <= 0) break
                 read += n
             }
-            val dims = parse(buffer, read) ?: return null
-            return dims.copy(bytes = total)
+            parse(buffer, read)?.copy(bytes = total)
         }
     }
 
