@@ -13,8 +13,8 @@ infrastructure is a static GitHub repository.
 Since **1.6.7** it works from the providers' own information alone: by default it makes **no requests to
 MangaBaka, AniList or any other metadata service** (MangaBaka/AniList remain an optional enhancement).
 
-> Status: early release (1.6.x). See [Compatibility](docs/COMPATIBILITY.md) for exactly what has and has
-> not been verified on each app.
+> Status: early release — current version **1.6.9** ([release notes](https://github.com/KarsTheUltimateCreation/library-of-alexandria/releases)).
+> See [Compatibility](docs/COMPATIBILITY.md) for exactly what has and has not been verified on each app.
 
 ## Install
 
