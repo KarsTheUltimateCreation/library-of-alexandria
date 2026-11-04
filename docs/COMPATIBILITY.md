@@ -1,18 +1,38 @@
 # Compatibility and validation status
 
-Last updated for version **1.6.6** (November 4, 2026). This page separates what was actually tested from what is
+Last updated for version **1.6.7** (November 4, 2026). This page separates what was actually tested from what is
 only expected to work. Nothing here is claimed as tested unless it was run.
 
 ## Validation performed
 
 | Level | What | Result |
 |---|---|---|
-| Unit tests (offline) | 158 tests (plus 5 opt-in live tests). 1.6.6 adds regression tests for: provider timeouts in cold, cached and parallel selection; caller cancellation and enclosing deadlines; `Retry-After` in seconds and all three HTTP-date forms; shared service cool-downs; budget-bounded jittered retries; queue time not counted as provider failure; stalled and cancelled body reads; chapter-list freshness (routine vs explicit), persistence across restarts, write-on-change; outage reporting; duplicate in-flight merging; truncated memos merged with full release lists; memo confidence; settings-sensitive choice caching; image recovery after headers; progressive discovery (initial set, gap- and failure-driven widening, thorough mode, weekly misses, specialty ordering); numbering-offset outlier choice; Asura Scans and MangaTown parsing | **Pass** (stable under CPU load; the previously flaky aggregation tests were made deterministic) |
-| Live integration (JVM) | 5 tests against the real services, including Asura Scans and MangaTown search → details → chapters → pages → image download | **Pass** (Nov 4 2026; third-party sites can change) |
-| Build validation | APK (versionCode 106006, lib 1.6) and JVM JAR assemble. JAR inspected: only `alexandria.*` and the extension package (no kotlin/kotlinx/OkHttp/Okio/Jsoup/extensions-lib/Injekt classes); Java 17 bytecode (AGP's generated `R` classes: Java 8); every referenced non-JDK package is host-provided (`jdeps`); no new runtime dependency. The JAR alone, with only the host libraries on the classpath, searched, listed chapters and fetched pages live (Asura Scans, MangaTown, WeebCentral) | **Pass** (local build is unsigned: no release key outside CI) |
-| Emulator (Mihon) | Mihon v0.21.3 on an Android 15 arm64 emulator — performed for **1.6.1** only, details below | **Not repeated for 1.6.6** |
+| Unit tests (offline) | 179 tests (plus 5 opt-in live tests and the opt-in request benchmark). 1.6.7 adds `ProviderOnlyTest`: every workflow (search, page 2, popular, latest, filtered browse, details, library updates, page resolution, a 1.6.x MangaBaka-keyed entry with stored MangaBaka artwork, an AniList-keyed entry, identity-key search) run against clients that record every request — **zero metadata-service requests**; corroboration-based identity (title alone never merges, different authors stay apart, editions/sequels separate, ambiguous duplicates refused); rejected hints regroup on the next search; manual link/unlink and its removal; stable identities across restart, provider reorder, a new provider and a removed provider; link recovery from the host's chapter records; title-only recovery needing two corroborating sources; field-level detail merging with provenance; local filters; tiered search and page 2; stale search results during an outage; busy providers avoided by optional work; shared provider searches/details; staggered library refreshes; a shared background discovery budget under 20 simultaneous updates; outage keeps chapters. Existing 1.6.6 regression tests (timeouts, cancellation, Retry-After, cool-downs, queue vs. network failures, persistence, memo confidence, settings-sensitive choice caching, image recovery, gap recovery) pass unchanged except that their fake providers now report an author (title-only matches are no longer confirmed) | **Pass** (3 consecutive clean runs) |
+| Live request benchmark (JVM) | `RateLimitBenchmark`: the same scripted session — 14 searches, opening each first result, four library updates of those 14 series 0 h / +8 h / +16 h / +24 h apart (simulated clock, 4 at a time), the same searches again an hour later, 2 searches during a library update, reading 2 chapters of 4 series (3 images each) — run against **1.6.6** and **1.6.7** with fresh state; every HTTP request counted per host | See [the comparison](#rate-limit-comparison-166-vs-167) |
+| Build validation | APK (versionCode 106007, lib 1.6) and JVM JAR assemble. JAR inspected: only `alexandria.*` and the extension package (no kotlin/kotlinx/OkHttp/Okio/Jsoup/extensions-lib/Injekt classes); Java 17 bytecode (AGP's generated `R` classes: Java 8); no new runtime dependency | **Pass** (local build is unsigned; the published APK/JAR are signed by the release workflow) |
+| Emulator (Mihon) | Mihon v0.21.3 on an Android 15 arm64 emulator — performed for **1.6.1** only | **Not repeated for 1.6.7** |
 | Physical device | — | **Not tested** |
-| Tachimanga (iOS) | — | **Not tested** (no iOS device/simulator runtime available; Tachimanga is closed source) |
+| Tachimanga (iOS) | — | **Not tested** (no iOS device/simulator runtime available; Tachimanga is closed source). Nothing on this page about Tachimanga is confirmed behaviour |
+
+## Rate-limit comparison (1.6.6 vs 1.6.7)
+
+Live run on Nov 4 2026, same machine and network, same script (`RateLimitBenchmark`), fresh state, default settings
+of each version. Third-party sites vary from run to run; this is one run each, not a statistical study.
+
+| | 1.6.6 | 1.6.7 |
+|---|---:|---:|
+| Total HTTP requests | 1,614 | **763** |
+| Requests to metadata services (MangaBaka / AniList, APIs and CDNs) | 37 | **0** |
+| HTTP 429 responses | 1 (nhentai) | **0** |
+| Requests refused locally by a service cool-down (`asked to wait`) | 3 (nhentai) | **0** |
+| Provider calls that timed out waiting for a local rate-limit slot | 3 (WeebCentral) | **0** |
+| Hitomi index requests (searched on every query in 1.6.6) | 391 | 123 |
+| Each library update after +8 h / +16 h / +24 h | 25.5 s / 25.9 s / 28.0 s | **9.1 s / 8.1 s / 7.9 s** |
+| Searches during a library update | 24.4 s | **6.9 s** |
+| User-visible failures | 0 | 0 |
+
+A first 1.6.7 build without the busy-provider rule still had 4 WeebCentral queue timeouts (WeebCentral allows 3
+requests per 6 s); routing optional work around a provider whose queue is already ≥ 3 s long removed them.
 
 ## Mihon
 
@@ -51,32 +71,39 @@ Target: Tachimanga **4.16+** (extension lib 1.6 support per its changelog). The 
 |---|---|---|
 | Install from `index.pb` | Same format as Keiyoushi's repo | — |
 | Lib 1.6 suspend API | Supported since 4.16 per changelog | — |
-| `SManga.memo` / `SChapter.memo` | Unknown | Provider links and releases are rebuilt from the extension's own cache / a chapter refresh |
+| `SManga.memo` / `SChapter.memo` | Unknown | Provider links come from the extension's own cache; if that was lost too, from the release memos in chapter records; if those are missing as well, from the title (two sources must corroborate) or a manual link |
+| Search page 2 (`hasNextPage`) | Expected (standard paging) | Without it, the remaining providers are still asked on page 1 when the main ones find little, and *Search every source* asks all of them |
 | Images loaded through the extension's OkHttp client | Unknown | Page-level and cover-level fallback silently do nothing; chapter-level fallback (in `getPageList`) still works |
 | `getSharedPreferences("source_<id>_cache")`, `("source_<id>_chapters")` | Expected (standard API) | Falls back to an in-memory cache: links and chapter lists are not kept across restarts, so the first opening after a restart refetches them |
 | Image loading after the headers (body stalls / breaks off) | Recovered only if images go through the extension client | The host shows its own image error; *retry* in the reader asks again |
 | Preference widgets | Switch / List / MultiSelect / EditText are standard extension widgets | — |
 | `OnPreferenceChangeListener` (clear-cache action) | Unknown | The action may not run; use the app's own "clear data" instead |
 
-### Device checklist (1.6.6, Tachimanga on iPhone)
+### Device checklist (1.6.7, Tachimanga on iPhone)
 
-Record the Tachimanga version and iOS version first. Each line names what to observe; "pass" means seen on the device.
+Record the Tachimanga version and iOS version first. "Pass" means seen on the device.
 
-1. **Install** – add the repository (or the JAR), install *Library of Alexandria 1.6.6*, open its settings: all eleven
-   settings render, including *Search every source*.
-2. **Search** – search "solo leveling": one unified entry; sequels, editions and doujinshi separate; results within ~6 s.
-3. **Chapters** – open the entry: chapter list appears; description lists linked sources (should include several).
-   Pull to refresh twice within a minute: the second refresh is near-instant (reused lists).
-4. **Reading** – open a chapter and a later one; page images load; moving to the next chapter works.
-5. **Fallback** – with *Preferred source* set to a provider, open a chapter; switch Wi-Fi off and on mid-chapter or put
-   the device in Low Data Mode, then reopen: the chapter still opens (another release if needed), no endless spinner.
-6. **Settings changes** – change *Preferred source* or *Reading quality*, reopen an already-read chapter: it now comes
-   from the new choice (not the earlier cached one).
-7. **Restart persistence** – force-quit Tachimanga, relaunch with the device offline, open a library series: the chapter
-   list is still there (nothing removed). Back online, open a chapter without refreshing first: it opens without a
-   long delay.
-8. **New providers** – search "overgeared" (Asura Scans) and "berserk" (MangaTown); open a chapter from each
-   (MangaTown pages load one by one).
+1. **Update / install** – update to *Library of Alexandria 1.6.7* (or install it), open its settings: *External
+   metadata* shows **Off**; all settings render.
+2. **Migration of existing entries** – open a series that was in the library before updating (an `mb:` entry):
+   chapters appear, read state is kept, the description still shows its earlier text, *Sources:* lists providers.
+   Use Tachimanga's *Migrate* on another source's entry and pick Library of Alexandria as the target: the search
+   inside migration finds the series (provider-only results), and migrating keeps read progress.
+3. **Search** – search "solo leveling" and "berserk": results within ~6 s, one entry per series, novels/sequels
+   separate. Scroll to the end of the results: a second page may load with more sources' entries.
+4. **Details** – open an entry: description, author, genres, status and cover are filled; the description's report
+   ends with *Details: description from …*. No entry shows MangaBaka/AniList as a source unless you enabled it.
+5. **Reading** – open a chapter and the next one; pages load.
+6. **Fallback** – set *Preferred source* to one provider, open a chapter; turn Wi-Fi off and on mid-chapter, reopen:
+   the chapter still opens (another release if needed), no endless spinner.
+7. **Settings changes** – change *Preferred source* or *Reading quality*, reopen an already-read chapter: it comes
+   from the new choice. Set *External metadata* to *MangaBaka + AniList* and search: catalogue results appear; set it
+   back to *Off*.
+8. **Library update / rate limits** – run a library update twice in a row and once after a few hours: no "HTTP 429",
+   "asked to wait" or "waiting for a local request slot" errors; the second run is quick.
+9. **Restart persistence** – force-quit, relaunch offline, open a library series: chapters are still there. Back
+   online, open a chapter without refreshing: it opens without a long delay. Search a library series again: it
+   shows as the same library entry (not a duplicate).
 
 Please report Tachimanga results in an issue so this table can be updated with facts.
 

@@ -24,10 +24,12 @@ Third-party work
 
 Data and services
 -----------------
-* MangaBaka (https://mangabaka.org). MangaBaka-original data is licensed CC BY-NC-SA 4.0;
+* MangaBaka (https://mangabaka.org), optional and off by default: it is only contacted when the
+  user enables it. MangaBaka-original data is licensed CC BY-NC-SA 4.0;
   third-party data belongs to its respective providers. Attribution is shown in each series
   description. The API is used unauthenticated within its documented rate limits.
-* AniList (https://anilist.co) GraphQL API, used read-only and unauthenticated.
+* AniList (https://anilist.co) GraphQL API, optional and off by default, used read-only and
+  unauthenticated when enabled.
 * MangaDex (https://mangadex.org) public API.
 * nhentai (https://nhentai.net) public API v2 and E-Hentai (https://e-hentai.org) gdata API,
   used read-only within their published limits.

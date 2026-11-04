@@ -44,8 +44,8 @@ import uy.kohesive.injekt.Injekt
 import uy.kohesive.injekt.api.get
 
 /**
- * Library of Alexandria: one catalogue source backed by several bundled content providers plus AniList and
- * MangaBaka metadata. All aggregation logic lives in the host-independent `:core` module; this class only
+ * Library of Alexandria: one catalogue source backed by several bundled content providers; MangaBaka and AniList
+ * metadata are optional (off by default, and then never contacted). All aggregation logic lives in the host-independent `:core` module; this class only
  * adapts it to the extensions-lib 1.6 API (suspend `getMangaUpdate` / `getPageList`, `memo` fields).
  */
 class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
@@ -54,7 +54,8 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
     /** English only. Published as "all" until 1.6.3; [id] keeps that original value so libraries stay attached. */
     override val lang = "en"
     override val id: Long = BuildConfig.SOURCE_ID
-    override val baseUrl = "https://mangabaka.org"
+    /** Not a metadata service: hosts may open it (WebView), and provider-only mode must not contact MangaBaka. */
+    override val baseUrl = "https://github.com/KarsTheUltimateCreation/library-of-alexandria"
     override val supportsLatest = true
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true; coerceInputValues = true; explicitNulls = false }
@@ -101,7 +102,7 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
 
     private val aggregator: Aggregator by lazy {
         // Confirmed provider links get their own budget so cover and metadata churn never evicts them.
-        val cache = CacheManager(store, maxPersistedEntries = 250, groupLimits = mapOf("state:" to 400))
+        val cache = CacheManager(store, maxPersistedEntries = 250, groupLimits = mapOf("state:" to 400, "idx:" to 2000, "rej:" to 300))
         val lists = CacheManager(listStore, maxPersistedEntries = MAX_STORED_LISTS, maxPersistedChars = MAX_STORED_LIST_CHARS)
         val health = ProviderHealth(store)
         val ctx = AdapterContext(client, json, userAgent)
@@ -130,14 +131,16 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
             val (cards, more) = aggregator.browse(query.trim(), catalogFilters, page, settings())
             return MangasPage(cards.map { it.toSManga() }, more)
         }
-        if (page > 1) return MangasPage(emptyList(), false)
         // Direct identity lookup: "mb:3397", "al:105398", "p:weebcentral:<id>" (also used for manual linking).
         SeriesKey.parse(query.trim())?.let { key ->
+            if (page > 1) return MangasPage(emptyList(), false)
             val update = aggregator.update(key, null, fetchDetails = true, fetchChapters = false, settings())
             return MangasPage(listOf(SManga.create().apply { url = key.value; title = update.details.title; thumbnail_url = update.details.coverUrl }), false)
         }
-        if (query.isBlank()) return getPopularManga(1)
-        return MangasPage(aggregator.search(query.trim(), settings()).map { it.toSManga() }, false)
+        if (query.isBlank()) return getPopularManga(page)
+        // Page 1 asks the most relevant sources; scrolling past its end asks the remaining ones (page 2).
+        val (cards, more) = aggregator.searchPage(query.trim(), page, settings())
+        return MangasPage(cards.map { it.toSManga() }, more)
     }
 
     private fun SeriesCard.toSManga() = SManga.create().apply {
@@ -153,7 +156,11 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
         val known = readMemo(manga)
         val s = settings()
         // The host asked (library update, refresh, first open): fetch again, except lists fetched moments ago.
-        val update = aggregator.update(key, known, fetchDetails, fetchChapters, s, Refresh.EXPLICIT)
+        val update = aggregator.update(
+            key, known, fetchDetails, fetchChapters, s, Refresh.EXPLICIT,
+            titleHint = manga.title.takeIf { it.isNotBlank() },
+            recovered = recoveredLinks(chapters),
+        )
 
         val newManga = if (fetchDetails) {
             SManga.create().apply {
@@ -168,7 +175,13 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
                 initialized = true
             }
         } else {
-            manga
+            manga.apply {
+                // A library cover still pointing at a metadata service that is no longer used: switch to a linked
+                // source's cover (stored, no request) so the library grid stops loading it.
+                if (!s.externalMetadata && thumbnail_url?.let(::isMetadataImage) == true) {
+                    aggregator.providerThumbnail(key, s)?.let { thumbnail_url = it }
+                }
+            }
         }
         writeMemo(newManga, update.state)
 
@@ -222,11 +235,15 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
 
     // ------------------------------------------------------------------ web links
 
-    override fun getMangaUrl(manga: SManga): String = when (val key = SeriesKey.parse(manga.url)) {
-        is SeriesKey.MangaBaka -> "https://mangabaka.org/${key.id}"
-        is SeriesKey.AniList -> "https://anilist.co/manga/${key.id}"
-        is SeriesKey.Provider -> aggregator.registry[key.sourceId]?.seriesWebUrl(key.seriesId) ?: baseUrl
-        null -> baseUrl
+    override fun getMangaUrl(manga: SManga): String {
+        val key = SeriesKey.parse(manga.url) ?: return baseUrl
+        val s = settings()
+        aggregator.webUrl(key, s)?.let { return it }
+        return when (key) {
+            is SeriesKey.MangaBaka -> if (s.mangabaka) "https://mangabaka.org/${key.id}" else baseUrl
+            is SeriesKey.AniList -> if (s.anilist) "https://anilist.co/manga/${key.id}" else baseUrl
+            is SeriesKey.Provider -> aggregator.registry[key.sourceId]?.seriesWebUrl(key.seriesId) ?: baseUrl
+        }
     }
 
     override fun getChapterUrl(chapter: SChapter): String {
@@ -248,6 +265,7 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
                 Settings.Action.CLEAR_METADATA -> { aggregator.cache.clear("meta:"); aggregator.cache.clear("cover:") }
                 Settings.Action.CLEAR_LINKS -> {
                     aggregator.cache.clear("state:"); aggregator.cache.clear("choice:"); aggregator.cache.clear("seriespref:")
+                    aggregator.cache.clear("idx:"); aggregator.cache.clear("rej:")
                     aggregator.clearChapterLists()
                 }
                 Settings.Action.CLEAR_ALL -> {
@@ -283,6 +301,22 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
         }?.takeIf { it.isNotEmpty() }
     }.getOrNull()
 
+    /**
+     * Provider links read back from the host's chapter records (the release memos this extension wrote): for each
+     * provider, the series most of its releases belong to. They let an entry keep its links when the extension's own
+     * cache was cleared or evicted, without searching or asking a metadata service.
+     */
+    private fun recoveredLinks(chapters: List<SChapter>): Map<String, String> = runCatching {
+        chapters.asSequence().take(400).flatMap { decodeReleases(it).orEmpty().asSequence() }
+            .groupBy { it.sourceId }
+            .mapValues { (_, rs) -> rs.groupingBy { it.seriesId }.eachCount().maxByOrNull { it.value }!!.key }
+    }.getOrDefault(emptyMap())
+
+    private fun isMetadataImage(url: String): Boolean {
+        val host = url.substringAfter("://").substringBefore('/').substringBefore('?').lowercase()
+        return METADATA_HOSTS.any { host == it || host.endsWith(".$it") }
+    }
+
     /** Provider links are kept in the manga memo so they survive cache clears and app reinstalls (Mihon persists memos). */
     private fun readMemo(manga: SManga): SeriesState? = runCatching {
         manga.memo[MEMO_STATE]?.let { json.decodeFromJsonElement(SeriesState.serializer(), it) }
@@ -315,6 +349,7 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
         private const val MEMO_BUDGET = 200_000
         private const val RELEASE_CHARS = 84
         private const val MAX_MEMO_RELEASES = 3
+        private val METADATA_HOSTS = setOf("mangabaka.org", "mangabaka.dev", "anilist.co")
 
         /** Provider chapter lists kept across restarts, and the largest one stored (≈1,500 chapters). */
         private const val MAX_STORED_LISTS = 48

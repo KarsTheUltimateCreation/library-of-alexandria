@@ -37,9 +37,10 @@ data class AggregatorSettings(
     /** Ordered languages, first is primary. Empty = no filtering. */
     val languages: List<String> = listOf("en"),
 
-    // Metadata
-    val anilist: Boolean = true,
-    val mangabaka: Boolean = true,
+    // Metadata. Off by default: provider information alone drives search, details, chapters and reading, and no
+    // request is made to MangaBaka or AniList (nor to their image CDNs). Either may be enabled as an enhancement.
+    val anilist: Boolean = false,
+    val mangabaka: Boolean = false,
     val metadataPreference: MetadataPreference = MetadataPreference.AUTO,
     val completenessChecking: Boolean = true,
 
@@ -61,6 +62,9 @@ data class AggregatorSettings(
     val chapterCacheMinutes: Int = 30,
     val cacheCovers: Boolean = true,
 ) {
+    /** True when some external metadata service may be contacted. False = provider-only mode. */
+    val externalMetadata: Boolean get() = mangabaka || anilist
+
     fun sourceRank(sourceId: String): Int {
         if (preferredSource == sourceId) return -1
         val i = sourceOrder.indexOf(sourceId)

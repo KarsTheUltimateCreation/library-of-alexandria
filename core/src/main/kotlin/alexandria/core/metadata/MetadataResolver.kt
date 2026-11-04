@@ -12,7 +12,8 @@ import alexandria.core.model.SourceSeries
 /**
  * Builds the authoritative [SeriesMetadata] for a series by combining MangaBaka and AniList (each optional),
  * caching results, and degrading gracefully: if a service is disabled or fails, the other one (or the
- * provider's own data) is used instead. Disabled services receive no requests.
+ * provider's own data) is used instead. Disabled services receive no requests: with both disabled (provider-only
+ * mode, the default) every entry point returns at once without touching the network.
  */
 class MetadataResolver(
     private val mangaBaka: MangaBakaClient,
@@ -22,7 +23,10 @@ class MetadataResolver(
     private val log: (String) -> Unit = {},
 ) {
 
-    suspend fun forKey(key: SeriesKey, settings: AggregatorSettings, providerHint: SourceSeries? = null): SeriesMetadata? = when (key) {
+    suspend fun forKey(key: SeriesKey, settings: AggregatorSettings, providerHint: SourceSeries? = null): SeriesMetadata? =
+        if (!settings.externalMetadata) providerHint?.asMetadata() else forKeyEnabled(key, settings, providerHint)
+
+    private suspend fun forKeyEnabled(key: SeriesKey, settings: AggregatorSettings, providerHint: SourceSeries?): SeriesMetadata? = when (key) {
         is SeriesKey.MangaBaka -> {
             val mb = if (settings.mangabaka) cached("mb:${key.id}", settings) { mangaBaka.series(key.id) } else null
             // AniList (30 req/min) only adds value when MangaBaka lacks a description/genres or is not preferred.
@@ -42,6 +46,7 @@ class MetadataResolver(
     /** Finds the metadata record for a provider-only series (by shared ids first, then by title search). */
     suspend fun matchProvider(series: SourceSeries, settings: AggregatorSettings): SeriesMetadata {
         val own = series.asMetadata()
+        if (!settings.externalMetadata) return own
         val alId = series.ids.anilist
         if (alId != null) {
             forKey(SeriesKey.AniList(alId), settings)?.let { return mergeWithProvider(it, series) }
@@ -58,6 +63,7 @@ class MetadataResolver(
     }
 
     suspend fun search(query: String, settings: AggregatorSettings, limit: Int = 12): List<SeriesMetadata> {
+        if (!settings.externalMetadata) return emptyList()
         val preferAniList = settings.metadataPreference == MetadataPreference.ANILIST || !settings.mangabaka
         if (!preferAniList) {
             safe("mangabaka search") { mangaBaka.search(query, limit) }?.takeIf { it.isNotEmpty() }?.let { return it }

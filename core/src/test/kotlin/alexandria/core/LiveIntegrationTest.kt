@@ -94,7 +94,9 @@ class LiveIntegrationTest {
         val cards = agg.search("Solo Leveling", settings)
         println("search: " + cards.take(8).joinToString { "${it.title} <${it.key}>" })
         val card = cards.first { it.title.equals("Solo Leveling", true) }
-        assertTrue(card.key is SeriesKey.MangaBaka, "expected MangaBaka identity, got ${card.key}")
+        // Default settings are provider-only: the series is identified by a provider entry, not a catalogue id.
+        if (settings.externalMetadata) assertTrue(card.key is SeriesKey.MangaBaka, "expected MangaBaka identity, got ${card.key}")
+        else assertTrue(card.key is SeriesKey.Provider, "expected a provider identity, got ${card.key}")
 
         val update = agg.update(card.key, null, fetchDetails = true, fetchChapters = true, settings)
         println("bindings: " + update.state.bindings.map { (k, v) -> "$k=${v.series.title} (${"%.2f".format(v.confidence)}: ${v.reason})" })
@@ -103,6 +105,7 @@ class LiveIntegrationTest {
         println("description tail:\n" + update.details.description?.substringAfter("— Library of Alexandria —"))
         assertTrue((update.chapters?.size ?: 0) >= 150)
         assertTrue(update.state.bindings.keys.containsAll(listOf("weebcentral")), "weebcentral should be linked")
+        assertTrue(update.state.bindings.size >= 2, "corroborated links to several providers without any metadata service")
         assertTrue(update.state.bindings.values.none { it.series.title.contains("novel", true) || it.series.title.contains("ragnarok", true) })
 
         val chapter = update.chapters!!.first { it.name.startsWith("Chapter 100") }

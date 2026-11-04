@@ -25,7 +25,12 @@ object Settings {
     private const val SPECIALS = "agg_specials"
     private const val ALT_TL = "agg_alt_tl"
     private const val PREFERRED_SOURCE = "agg_preferred_source"
-    private const val META_SOURCE = "meta_source"
+    /**
+     * External metadata (1.6.7+). A new key on purpose: earlier versions had no "off" choice, so their stored value
+     * (`meta_source`) says nothing about whether the user wants these services; everyone starts provider-only.
+     */
+    private const val META_MODE = "meta_mode"
+    private const val META_OFF = "OFF"
     private const val COMPLETENESS = "meta_completeness"
     private const val ENABLED = "src_enabled"
     /** Provider ids that existed when the user last saved [ENABLED]; providers added later start enabled. */
@@ -40,8 +45,6 @@ object Settings {
     // Settings from 1.6.4 and earlier, read once as defaults for the merged choices above.
     private const val OLD_QUALITY = "quality_opt"
     private const val OLD_QUALITY_MODE = "quality_mode"
-    private const val OLD_ANILIST = "meta_anilist"
-    private const val OLD_MANGABAKA = "meta_mangabaka"
 
     private const val QUALITY_OFF = "OFF"
 
@@ -50,7 +53,7 @@ object Settings {
         fun b(k: String, def: Boolean) = runCatching { p.getBoolean(k, def) }.getOrDefault(def)
         fun s(k: String, def: String) = runCatching { p.getString(k, def) }.getOrNull() ?: def
         val quality = s(QUALITY_LEVEL, legacyQuality(p))
-        val metaSource = s(META_SOURCE, legacyMetaSource(p))
+        val metaSource = s(META_MODE, META_OFF)
         return d.copy(
             highQualityCovers = b(COVER_HQ, d.highQualityCovers),
             qualityOptimization = quality != QUALITY_OFF,
@@ -59,8 +62,8 @@ object Settings {
             showAlternativeTranslations = b(ALT_TL, d.showAlternativeTranslations),
             preferredSource = s(PREFERRED_SOURCE, "auto").takeUnless { it == "auto" || it.isBlank() },
             languages = listOf("en"), // the extension is English-only
-            mangabaka = metaSource != "ANILIST",
-            anilist = metaSource != "MANGABAKA",
+            mangabaka = metaSource == "AUTO" || metaSource == "MANGABAKA",
+            anilist = metaSource == "AUTO" || metaSource == "ANILIST",
             metadataPreference = enumOr(metaSource, MetadataPreference.AUTO),
             completenessChecking = b(COMPLETENESS, d.completenessChecking),
             enabledSources = enabledSources(p, allSources),
@@ -72,16 +75,6 @@ object Settings {
     private fun legacyQuality(p: SharedPreferences): String = runCatching {
         if (!p.getBoolean(OLD_QUALITY, true)) QUALITY_OFF else p.getString(OLD_QUALITY_MODE, "BEST") ?: "BEST"
     }.getOrDefault("BEST")
-
-    private fun legacyMetaSource(p: SharedPreferences): String = runCatching {
-        val mb = p.getBoolean(OLD_MANGABAKA, true)
-        val al = p.getBoolean(OLD_ANILIST, true)
-        when {
-            mb && !al -> "MANGABAKA"
-            al && !mb -> "ANILIST"
-            else -> "AUTO"
-        }
-    }.getOrDefault("AUTO")
 
     /**
      * Never-configured = all providers; an explicitly emptied selection must mean none, not all. Providers added
@@ -121,7 +114,7 @@ object Settings {
             },
         )
 
-        switch(COVER_HQ, "High-quality covers", "Pick the best artwork from MangaBaka, AniList and the linked sources.", true)
+        switch(COVER_HQ, "High-quality covers", "Compare the linked sources' covers (and the metadata service's, when enabled) and pick the best.", true)
 
         list(
             QUALITY_LEVEL, "Reading quality",
@@ -143,13 +136,14 @@ object Settings {
         switch(ALT_TL, "Separate translations", "List each translation group's release as its own chapter.", false)
 
         list(
-            META_SOURCE, "Metadata",
+            META_MODE, "External metadata",
             listOf(
-                Triple("AUTO", "MangaBaka + AniList", ""),
+                Triple(META_OFF, "Off", "sources only; no requests to metadata services (recommended)"),
+                Triple("AUTO", "MangaBaka + AniList", "adds catalogue details, filters and popular lists; rate-limited services"),
                 Triple("MANGABAKA", "MangaBaka only", ""),
                 Triple("ANILIST", "AniList only", ""),
             ),
-            legacyMetaSource(p),
+            META_OFF,
         )
         switch(COMPLETENESS, "Source report", "End the description with linked sources, recovered and missing chapters.", true)
 
@@ -179,8 +173,9 @@ object Settings {
             EditTextPreference(ctx).apply {
                 key = LINKS
                 title = "Manual series links"
-                val help = "Fix a wrong match: <series> = <provider>:<id>, <provider>:- ; entries separated by ';'. " +
-                    "Example: mb:3397 = weebcentral:01J76XYCPSY3C4BNPBRY8JMCBE"
+                val help = "Link or unlink sources by hand: <series> = <provider>:<id>, <provider>:- ; entries separated by ';'. " +
+                    "<series> is the entry's id (p:<provider>:<id>, or mb:/al: for older entries). " +
+                    "Example: p:mangapill:723/one-piece = weebcentral:01J76XYCPSY3C4BNPBRY8JMCBE, mangadex:-"
                 fun describe(v: String?) = if (v.isNullOrBlank()) help else "$help\nCurrent: $v"
                 summary = describe(p.getString(LINKS, ""))
                 dialogTitle = title

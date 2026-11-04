@@ -49,7 +49,7 @@ class AggregatorTest {
             searches.incrementAndGet()
             if (slowSearchMs > 0) delay(slowSearchMs)
             if (failSearch) throw HttpError(503, "$baseUrl/search")
-            return listOf(SourceSeries(id, "s-$id", title, ids = ids), SourceSeries(id, "novel-$id", "$title Novel"))
+            return listOf(SourceSeries(id, "s-$id", title, ids = ids, authors = listOf("Test Author")), SourceSeries(id, "novel-$id", "$title Novel"))
         }
 
         override suspend fun chapters(series: SourceSeries, languages: List<String>) =

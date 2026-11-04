@@ -155,6 +155,43 @@ providers contribute chapters, a linked provider failed with nothing cached, the
 what was found, or the completeness report shows possible gaps. *Search every source* searches all at once.
 Searched providers without a match are skipped for a week, as before.
 
+**Provider-only mode (1.6.7, default).** External metadata is off unless the user enables it, and then no request
+reaches MangaBaka or AniList — not their APIs, not their image CDNs — on any path (search, popular/latest, filtered
+browse, details, matching, cover selection, library refresh, page resolution). `MetadataResolver` returns at once
+when both services are disabled, `Aggregator` never calls it, and covers whose candidate provider is a metadata
+service are dropped (the cover cache key includes the mode, so artwork chosen by 1.6.x is not reused). This is
+covered by a JVM test that runs every workflow against clients that record each request.
+
+- *Search* asks the five most relevant healthy general providers (discovery hit rate, health, preference; fixed
+  provider order on ties); when they return fewer than three relevant titles, the others (MangaDex, adult and gallery
+  sites) are asked at once, otherwise only when the host asks for page 2. Hits are grouped by `SearchClusterer`:
+  same title and edition qualifiers, or a shared id, and nothing contradictory (ids, novel/comic, years > 3 apart,
+  different Latin-script authors); never across provider roles; at most one hit per provider. A grouping is a display
+  decision only. The other providers in it are *hints* (`Binding.hint`), checked against the provider's details
+  when the series is opened and dropped (and remembered as rejected, `rej:` and `SeriesState.rejected`) unless the
+  details corroborate the match.
+- *Identity* (`IdentityResolver`): a title match (≥ 0.90) confirms only with support ≥ 1 — an author in common
+  (word-order and case-insensitive), years within one, a second agreeing title variant, or shared ids; same format or
+  same status add 0.25 each and never suffice. Latin-script author lists with no name in common subtract 0.3. Two
+  equally good candidates on one provider are still refused.
+- *Stable identities*: confirmed links are indexed (`idx:<provider>:<id>` → series key, first writer wins, 2,000
+  entries), so search, popular and latest show a provider entry as the series it belongs to, whatever the provider
+  order or newly added providers. New series are keyed `p:<provider>:<id>` with the anchor chosen in fixed registry
+  order, never the user's order. `mb:`/`al:` keys from earlier versions keep working: their stored record (and its
+  MangaBaka attribution) is shown without being refreshed, and their links come from the stored state, the manga
+  memo, or — when both are gone — the release memos in the host's own chapter records (`recovered`). Only when none
+  survives is the host's title used, and then two providers must corroborate each other (same exact title plus an
+  author, year or id) before anything is linked.
+- *Details* (`DetailsMerger`): external record (when present) → entry source and manual links → confidence →
+  fixed provider order. The first description of ≥ 80 characters wins (else the longest); authors, status, format,
+  year and language come from the first source that knows them; genres and alternative titles are unions. The
+  description's report names the source of each field.
+- *Library updates* (`getMangaUpdate` with `fetchDetails = false`) refresh the two linked providers whose last lists
+  reach furthest on every update, and the others when their list is older than 6 h; a pull-to-refresh asks everyone.
+  Searches they trigger take tokens from a shared, non-blocking per-provider budget (6/min) and are skipped (not
+  queued, not recorded as misses) when it is spent; the every-provider widening runs at most every 12 h per series.
+  Provider search results and details are shared for 20 min between search, linking and updates (single-flight).
+
 ## 4. Known limitations
 
 - Providers behind Cloudflare challenges or logins are not supported in the aggregation path.
@@ -168,6 +205,10 @@ Searched providers without a match are skipped for a week, as before.
   extreme saturation of the host's dispatcher a recovery waits for a free slot (bounded by provider timeouts).
 - The series preference (last comparison's ranking, reused 3 days) skips the comparison for later chapters of a
   series; it is a speed trade-off and does not re-measure each chapter.
+- Provider-only mode cannot use MangaBaka's catalogue: filtered browsing depends on what providers report, there is
+  no original-run chapter count (so "likely untranslated" ranges are not reported), and popular/latest lists are the
+  providers' own.
+- Library updates take a new chapter from a non-leading provider up to 6 h later than from a leading one.
 - Service cool-downs are kept in memory only; after an app restart a service is asked again (and re-pauses on 429).
 - Asura Scans chapters with scrambled (tiled) pages and premium/early-access chapters are not readable from Asura;
   other providers' releases serve them.

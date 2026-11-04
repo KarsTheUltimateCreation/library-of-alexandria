@@ -283,6 +283,13 @@ class RateLimiter(
     private val mutex = Mutex()
     private var tokens = permits.toDouble()
     private var last = clock()
+    private val waiters = java.util.concurrent.atomic.AtomicInteger()
+
+    /**
+     * Roughly how long a new request would wait for a token right now (callers already queued × token interval).
+     * Lets optional work go elsewhere instead of joining a queue that would outlast its deadline.
+     */
+    fun backlogMs(): Long = waiters.get() * periodMillis / permits
 
     suspend fun acquire() {
         acquire(null)
@@ -308,7 +315,8 @@ class RateLimiter(
             }
             if (wait == 0L) return true
             if (maxWaitMs != null && waited + wait > maxWaitMs) return false
-            delay(wait)
+            waiters.incrementAndGet()
+            try { delay(wait) } finally { waiters.decrementAndGet() }
             waited += wait
         }
     }
@@ -319,5 +327,8 @@ class RateLimiter(
         /** Process-wide limiter per key so every component shares one budget per service. */
         fun shared(key: String, permits: Int, periodMillis: Long): RateLimiter =
             shared.getOrPut(key) { RateLimiter(permits, periodMillis, key = key) }
+
+        /** Current backlog of the shared limiter [key] (0 when there is none). Providers' limiters use their id. */
+        fun backlogMs(key: String): Long = shared[key]?.backlogMs() ?: 0L
     }
 }

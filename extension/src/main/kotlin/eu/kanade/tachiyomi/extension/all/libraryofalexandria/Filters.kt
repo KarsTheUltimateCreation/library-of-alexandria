@@ -5,8 +5,10 @@ import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 
 /**
- * Browse/search filters. They are applied by MangaBaka's catalogue search, so a filtered search lists catalogue
- * entries (every one of them opens with all linked providers); provider-only titles show up in plain searches.
+ * Browse/search filters. With MangaBaka enabled they are applied by its catalogue search. In the default
+ * provider-only mode they are applied to the providers' results as far as each provider reports the field
+ * (see alexandria.core.merge.LocalFilters): unreported values do not match include filters, and only title sorting
+ * is available.
  */
 object Filters {
 
@@ -70,7 +72,7 @@ object Filters {
     private class GenreGroup(options: List<Option>) : Filter.Group<GenreState>("Genres (tap twice to exclude)", options.map { GenreState(it) })
 
     fun list(): FilterList = FilterList(
-        Filter.Header("Filters search the MangaBaka catalogue"),
+        Filter.Header("Without MangaBaka, filters apply to what sources report"),
         SortFilter(),
         OptionGroup("Type", TYPES),
         OptionGroup("Status", STATUSES),

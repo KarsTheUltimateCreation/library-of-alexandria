@@ -87,13 +87,63 @@ class IdentityResolver(
             reasons += "status ${reference.status} vs ${candidate.status}"
         }
 
+        // Equal titles are not enough on their own: different works share titles ("Blue", "Monster", remakes, same-name
+        // webtoons). A confirmation needs at least one independent signal that the two entries describe the same work.
+        val (support, supportReasons, contradiction) = corroboration(reference, candidate, refTitles, candTitles)
+        reasons += supportReasons
+        score -= contradiction
+
         score = score.coerceIn(0.0, 1.0)
         val decision = when {
-            score >= confirmThreshold -> MatchDecision.CONFIRMED
+            score >= confirmThreshold && support >= 1.0 -> MatchDecision.CONFIRMED
+            score >= confirmThreshold -> {
+                reasons += UNCORROBORATED
+                MatchDecision.AMBIGUOUS
+            }
             score >= ambiguousThreshold -> MatchDecision.AMBIGUOUS
             else -> MatchDecision.REJECTED
         }
         return MatchResult(score, decision, reasons)
+    }
+
+    /**
+     * Evidence beyond the best title pair: (support, reasons, penalty). Support >= 1 is needed to confirm.
+     *  - an author in common (names compared word-order- and case-insensitively): 1
+     *  - publication years within one year of each other: 1
+     *  - a second, different title variant that also agrees (e.g. English *and* native title): 1
+     *  - same specific format, same known status: 0.25 each (never enough alone)
+     * Author lists in Latin script that share no name are a contradiction (another work of the same title).
+     */
+    private fun corroboration(reference: SeriesMetadata, candidate: SourceSeries, refTitles: List<String>, candTitles: List<String>): Triple<Double, List<String>, Double> {
+        var support = 0.0
+        var penalty = 0.0
+        val reasons = mutableListOf<String>()
+        val ra = reference.authors + reference.artists
+        val ca = candidate.authors
+        if (ra.isNotEmpty() && ca.isNotEmpty()) {
+            if (authorsOverlap(ra, ca)) {
+                support += 1.0
+                reasons += "author in common"
+            } else if ((ra + ca).all(::latinOnly) && !sharesNameWord(ra, ca)) {
+                penalty += 0.3
+                reasons += "different authors (${ra.take(2).joinToString()} vs ${ca.take(2).joinToString()})"
+            }
+        }
+        val ry = reference.year
+        val cy = candidate.year
+        if (ry != null && cy != null && kotlin.math.abs(ry - cy) <= 1) {
+            support += 1.0
+            reasons += "year agrees"
+        }
+        val candCompact = candTitles.map { TitleNormalizer.compact(it) }.filter { it.isNotEmpty() }.toSet()
+        val agreeing = refTitles.map { TitleNormalizer.compact(it) }.filter { it.length >= 3 && it in candCompact }.toSet()
+        if (agreeing.size >= 2) {
+            support += 1.0
+            reasons += "${agreeing.size} title variants agree"
+        }
+        if (reference.kind != ContentKind.UNKNOWN && reference.kind == candidate.kind) support += 0.25
+        if (reference.status != PublicationStatus.UNKNOWN && reference.status == candidate.status) support += 0.25
+        return Triple(support, reasons, penalty)
     }
 
     /**
@@ -138,7 +188,25 @@ class IdentityResolver(
             (a == PublicationStatus.ONGOING && b == PublicationStatus.COMPLETED)
     }
 
-    private companion object {
+    companion object {
         const val ID_REASON = "shared database id"
+        const val UNCORROBORATED = "title only: no author, year or second title in common"
+
+        private fun nameKey(name: String) = TitleNormalizer.normalize(name).split(' ').filter { it.isNotEmpty() }.sorted().joinToString(" ")
+
+        /** "Oda Eiichiro" = "Eiichiro ODA" = "oda eiichiro"; "Chugong" = "Chu-Gong". */
+        fun authorsOverlap(a: Collection<String>, b: Collection<String>): Boolean {
+            val ka = a.flatMap { splitNames(it) }.flatMap { listOf(nameKey(it), TitleNormalizer.compact(it)) }.filter { it.length >= 2 }.toSet()
+            return b.flatMap { splitNames(it) }.any { n -> nameKey(n) in ka || TitleNormalizer.compact(n) in ka }
+        }
+
+        private fun splitNames(s: String) = s.split(',', ';', '/', '&', '、').map { it.trim() }.filter { it.isNotEmpty() }
+
+        private fun sharesNameWord(a: Collection<String>, b: Collection<String>): Boolean {
+            val wa = a.flatMap { TitleNormalizer.normalize(it).split(' ') }.filter { it.length >= 3 }.toSet()
+            return b.flatMap { TitleNormalizer.normalize(it).split(' ') }.any { it.length >= 3 && it in wa }
+        }
+
+        private fun latinOnly(s: String) = s.all { !it.isLetter() || it.code < 0x250 }
     }
 }

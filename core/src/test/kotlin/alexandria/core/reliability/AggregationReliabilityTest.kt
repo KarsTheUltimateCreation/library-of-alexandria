@@ -59,12 +59,12 @@ private class Provider(
 
     override suspend fun search(query: String): List<SourceSeries> {
         searches.incrementAndGet()
-        return if (carries) listOf(SourceSeries(id, "s-$id", "Example Series"), SourceSeries(id, "n-$id", "Example Series Novel", kind = ContentKind.NOVEL)) else emptyList()
+        return if (carries) listOf(SourceSeries(id, "s-$id", "Example Series", authors = listOf("Test Author")), SourceSeries(id, "n-$id", "Example Series Novel", kind = ContentKind.NOVEL)) else emptyList()
     }
 
     /** Details name the work, as real providers' detail pages do (the anchor of a provider-only series needs it). */
     override suspend fun details(series: SourceSeries): SourceSeries =
-        if (series.id == "s-$id") series.copy(title = "Example Series", detailed = true) else series
+        if (series.id == "s-$id") series.copy(title = "Example Series", authors = listOf("Test Author"), detailed = true) else series
 
     override suspend fun chapters(series: SourceSeries, languages: List<String>): List<SourceChapter> {
         chapterCalls.incrementAndGet()
@@ -302,7 +302,7 @@ class AggregationReliabilityTest {
         val mangaKey = SeriesKey.Provider("alpha", "s-alpha")
         val known = alexandria.core.SeriesState(
             mangaKey.value, alexandria.core.model.SeriesMetadata("alpha", title = "Example Series", kind = ContentKind.MANGA),
-            bindings = mapOf("alpha" to alexandria.core.Binding(SourceSeries("alpha", "s-alpha", "Example Series", detailed = true), 1.0, "entry source")),
+            bindings = mapOf("alpha" to alexandria.core.Binding(SourceSeries("alpha", "s-alpha", "Example Series", authors = listOf("Test Author"), detailed = true), 1.0, "entry source")),
         )
         agg.update(mangaKey, known, false, true, s)
         assertTrue(general.all { it.searches.get() > 0 }, "general sites first")
