@@ -1,0 +1,44 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: "platforms;android-37.0 build-tools;36.0.0"
+      - uses: gradle/actions/setup-gradle@v6
+      # Unsigned-key (debug-signed) build: proves the APK/JAR assemble. Releases are signed in release.yml.
+      - name: Assemble extension
+        run: ./gradlew :extension:assembleRelease
+      - name: Verify APK contents
+        run: |
+          APK=$(ls extension/build/outputs/apk/release/*.apk)
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$BT/aapt2" dump badging "$APK" | grep -E "package|uses-feature: name='tachiyomi.extension'"
+          # Host-provided libraries must not be bundled (they would shadow the app's copies).
+          unzip -o -q "$APK" classes.dex -d dexcheck
+          if "$BT/dexdump" dexcheck/classes.dex | grep -E "Class descriptor.*'L(kotlin|kotlinx|okhttp3|org/jsoup|eu/kanade/tachiyomi/source)/" ; then
+            echo "::error::host-provided classes were bundled into the APK"; exit 1
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: extension-unsigned-key
+          path: |
+            extension/build/outputs/apk/release/*.apk
+            extension/build/outputs/jar/release/*.jar
+            extension/build/outputs/extension-metadata.json

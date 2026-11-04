@@ -1,0 +1,95 @@
+name: Release
+
+# Builds the signed extension and publishes the static repository to the `repo` branch.
+# Required repository secrets (see docs/RELEASING.md):
+#   SIGNING_KEY         base64 of the release keystore (keep it forever: Mihon refuses updates signed by another key)
+#   ALIAS               key alias
+#   KEY_STORE_PASSWORD  keystore password
+#   KEY_PASSWORD        key password
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: android-actions/setup-android@v4
+        with:
+          packages: "platforms;android-37.0 build-tools;36.0.0"
+      - uses: gradle/actions/setup-gradle@v6
+
+      - name: Tests
+        run: ./gradlew :core:test
+
+      - name: Restore signing key
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          if [ -z "$SIGNING_KEY" ]; then echo "::error::SIGNING_KEY secret is not set"; exit 1; fi
+          echo "$SIGNING_KEY" | base64 -d > signingkey.jks
+
+      - name: Build signed extension
+        env:
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew :extension:assembleRelease
+
+      - name: Verify signature and compute fingerprint
+        id: sig
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          APK=$(ls extension/build/outputs/apk/release/*.apk)
+          "$BT/apksigner" verify --print-certs "$APK" | tee sig.txt
+          if grep -q "CN=Android Debug" sig.txt; then echo "::error::APK is debug-signed"; exit 1; fi
+          FP=$(grep -m1 "certificate SHA-256 digest" sig.txt | awk '{print $NF}')
+          echo "fingerprint=$FP" >> "$GITHUB_OUTPUT"
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+          echo "jar=$(ls extension/build/outputs/jar/release/*.jar)" >> "$GITHUB_OUTPUT"
+          jarsigner -verify "$(ls extension/build/outputs/jar/release/*.jar)" | tail -1
+
+      - name: Generate repository
+        run: |
+          python3 -I scripts/publish_repo.py \
+            --metadata extension/build/outputs/extension-metadata.json \
+            --apk "${{ steps.sig.outputs.apk }}" \
+            --jar "${{ steps.sig.outputs.jar }}" \
+            --icon docs/icon-512.png \
+            --base-url "https://raw.githubusercontent.com/${{ github.repository }}/repo" \
+            --website "https://github.com/${{ github.repository }}" \
+            --fingerprint "${{ steps.sig.outputs.fingerprint }}" \
+            --out repo-out
+
+      - name: Publish to repo branch
+        run: |
+          rm -f signingkey.jks
+          cd repo-out
+          git init -q -b repo
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Publish ${GITHUB_REF_NAME} (${GITHUB_SHA::7})"
+          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" repo:repo
+
+      - name: GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            ${{ steps.sig.outputs.apk }}
+            ${{ steps.sig.outputs.jar }}

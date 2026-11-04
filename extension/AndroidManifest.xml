@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Extension metadata read by Mihon's ExtensionLoader (tachiyomi.extension feature + meta-data keys). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-feature android:name="tachiyomi.extension" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="Tachiyomi: ${extName}">
+
+        <meta-data android:name="tachiyomix.name" android:value="${extName}" />
+        <meta-data android:name="tachiyomi.extension.class" android:value="${extClass}" />
+        <!-- Aggregated providers include content of every rating MangaDex serves below "pornographic". -->
+        <meta-data android:name="tachiyomi.extension.nsfw" android:value="1" />
+        <meta-data android:name="tachiyomix.contentWarning" android:value="1" />
+        <meta-data android:name="tachiyomix.extensionLib" android:value="${extLib}" />
+    </application>
+</manifest>

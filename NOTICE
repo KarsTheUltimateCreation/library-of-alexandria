@@ -1,0 +1,26 @@
+Library of Alexandria
+Copyright 2026 Library of Alexandria contributors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party work
+----------------
+* Provider parsing for WeebCentral and MangaPill (CSS selectors, request pacing), and the
+  extension JAR packaging/signing approach in buildSrc/, are adapted from
+  keiyoushi/extensions-source (https://github.com/keiyoushi/extensions-source),
+  Copyright the Keiyoushi contributors, Apache License 2.0.
+* The repository index schema follows mihonapp/tachiyomix index/index.proto
+  (https://github.com/mihonapp/tachiyomix), Apache License 2.0, including the keiyoushi
+  `Resources.jarUrl` (field 501) extension.
+* The extension compiles against keiyoushi/extensions-lib (Apache License 2.0); it is a
+  compile-only dependency and is not redistributed.
+
+Data and services
+-----------------
+* MangaBaka (https://mangabaka.org). MangaBaka-original data is licensed CC BY-NC-SA 4.0;
+  third-party data belongs to its respective providers. Attribution is shown in each series
+  description. The API is used unauthenticated within its documented rate limits.
+* AniList (https://anilist.co) GraphQL API, used read-only and unauthenticated.
+* MangaDex (https://mangadex.org) public API.
+Library of Alexandria hosts no content and runs no server; all requests are made from the
+user's device.
