@@ -104,8 +104,10 @@ class MangaBakaClient(private val client: OkHttpClient, private val json: Json, 
         val secondary = (o["secondary_titles"] as? JsonObject)?.values?.flatMap { v ->
             runCatching { v.jsonArray.mapNotNull { e -> e.jsonObject["title"]?.jsonPrimitive?.contentOrNull } }.getOrDefault(emptyList())
         }.orEmpty()
-        val englishTitle = (o["titles"] as? kotlinx.serialization.json.JsonArray)?.mapNotNull { it as? JsonObject }
-            ?.firstOrNull { it["language"]?.jsonPrimitive?.contentOrNull == "en" && it["is_primary"]?.jsonPrimitive?.contentOrNull == "true" }
+        val english = (o["titles"] as? kotlinx.serialization.json.JsonArray)?.mapNotNull { it as? JsonObject }
+            ?.filter { it["language"]?.jsonPrimitive?.contentOrNull == "en" }.orEmpty()
+        // The primary English title, else the first English title listed.
+        val englishTitle = (english.firstOrNull { it["is_primary"]?.jsonPrimitive?.contentOrNull == "true" } ?: english.firstOrNull())
             ?.get("title")?.jsonPrimitive?.contentOrNull
         val coverRaw = (o["cover"] as? JsonObject)?.get("raw") as? JsonObject
         val id = o["id"]!!.jsonPrimitive.content.toLong()

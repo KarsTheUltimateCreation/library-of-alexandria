@@ -136,6 +136,22 @@ data class SeriesMetadata(
     val thumbnailUrl: String? = null,
     val webUrl: String? = null,
 ) {
+    /**
+     * What users see. The extension is English-only, so the English title wins over the database's main title
+     * (MangaBaka's `title` is the romanized original for many non-Japanese works, e.g. "Yongsaneun Swil Su Eopda").
+     */
+    val displayTitle: String
+        get() {
+            val english = englishTitle?.trim()?.takeIf { it.isNotEmpty() } ?: return title
+            // Publisher stylings like "ONE PIECE" / "BERSERK": prefer the same title in normal case when one exists.
+            if (english.any { it.isLetter() } && english.none { it.isLowerCase() }) {
+                (listOf(title) + listOfNotNull(romanizedTitle) + altTitles)
+                    .firstOrNull { it.equals(english, ignoreCase = true) && it.any(Char::isLowerCase) }
+                    ?.let { return it.trim() }
+            }
+            return english
+        }
+
     /** Every title variant, most authoritative first, without duplicates. */
     fun allTitles(): List<String> =
         (listOfNotNull(title, englishTitle, romanizedTitle, nativeTitle) + altTitles)

@@ -138,7 +138,7 @@ class Aggregator(
             val matched = hits.mapNotNull { (sid, list) -> identity.pick(m, list)?.let { sid to it } }
             matched.forEach { (sid, p) -> claimed += sid to p.first.id }
             rememberHints(key, m, matched.associate { (sid, p) -> sid to Binding(p.first, p.second.score, "search") })
-            val card = SeriesCard(key, m.title, quickCover(m, matched.map { it.second.first }, settings))
+            val card = SeriesCard(key, m.displayTitle, quickCover(m, matched.map { it.second.first }, settings))
             if (matched.isNotEmpty()) withHits += card else withoutHits += card
         }
 
@@ -156,7 +156,7 @@ class Aggregator(
 
     suspend fun popular(page: Int, settings: AggregatorSettings): Pair<List<SeriesCard>, Boolean> {
         metadata.popular(page, settings)?.takeIf { it.isNotEmpty() }?.let { list ->
-            return list.mapNotNull { m -> keyFor(m)?.let { SeriesCard(it, m.title, quickCover(m, emptyList(), settings)) } } to true
+            return list.mapNotNull { m -> keyFor(m)?.let { SeriesCard(it, m.displayTitle, quickCover(m, emptyList(), settings)) } } to true
         }
         val adapter = registry.enabled(settings, includeUnhealthy = false).firstOrNull() ?: return emptyList<SeriesCard>() to false
         val list = guarded(adapter, settings) { adapter.popular(page) }.orEmpty()
@@ -473,7 +473,7 @@ class Aggregator(
             if (credit.isNotEmpty()) append("Metadata: ").append(credit.joinToString(", ")).append('\n')
         }.trim()
         return SeriesDetails(
-            title = m?.title ?: state.bindings.values.firstOrNull()?.series?.title ?: state.key,
+            title = m?.displayTitle ?: state.bindings.values.firstOrNull()?.series?.title ?: state.key,
             author = m?.authors?.joinToString()?.ifEmpty { null },
             artist = m?.artists?.joinToString()?.ifEmpty { null },
             description = description,

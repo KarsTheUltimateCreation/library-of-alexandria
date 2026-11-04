@@ -5,7 +5,9 @@ This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 Third-party work
 ----------------
-* Provider parsing for WeebCentral and MangaPill (CSS selectors, request pacing), and the
+* Provider parsing for WeebCentral, MangaPill, MangaKatana, MangaRead (Madara multisrc) and
+  mgeko (MangaRawClub), and the Atsumaru API usage
+  (CSS selectors, request logic, request pacing), and the
   extension JAR packaging/signing approach in buildSrc/, are adapted from
   keiyoushi/extensions-source (https://github.com/keiyoushi/extensions-source),
   Copyright the Keiyoushi contributors, Apache License 2.0.

@@ -9,10 +9,15 @@ plugins {
 }
 
 /** Bump on every release. The full version is "<libVersion>.<extVersionCode>" (e.g. 1.6.1). */
-val extVersionCode = 2
+val extVersionCode = 3
 val libVersion = "1.6"
 val extName = "Library of Alexandria"
-val extLang = "all"
+val extLang = "en"
+/**
+ * Until 1.6.3 the source was published as lang "all"; Mihon derives the source id from "name/lang/versionId",
+ * so the id is pinned to that original value to keep users' libraries, settings and cache attached.
+ */
+val sourceId = computeSourceId(extName, "all")
 val pkgSuffix = "all.libraryofalexandria"
 
 val signingKey = rootProject.file("signingkey.jks")
@@ -31,6 +36,7 @@ android {
         manifestPlaceholders["extClass"] = "eu.kanade.tachiyomi.extension.$pkgSuffix.LibraryOfAlexandria"
         manifestPlaceholders["extLib"] = libVersion
         buildConfigField("String", "VERSION", "\"$libVersion.$extVersionCode\"")
+        buildConfigField("long", "SOURCE_ID", "${sourceId}L")
     }
 
     sourceSets["main"].apply {
@@ -124,7 +130,7 @@ val writeExtensionMetadata by tasks.registering {
     val out = layout.buildDirectory.file("outputs/extension-metadata.json")
     outputs.file(out)
     doLast {
-        val id = computeSourceId(extName, extLang)
+        val id = sourceId
         out.get().asFile.writeText(
             """
             {

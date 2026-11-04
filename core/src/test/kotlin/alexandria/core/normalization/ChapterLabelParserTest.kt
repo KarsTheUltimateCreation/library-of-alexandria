@@ -86,6 +86,17 @@ class ChapterLabelParserTest {
     }
 
     @Test
+    fun `chapter number followed by a numbered side story is the chapter`() {
+        // Atsumaru writes these without a separator; other providers write "Chapter 200: Side Story 21".
+        assertEquals(key("Chapter 200: Side Story 21 [END]"), key("Chapter 200 Side Story 21 { THE END }"))
+        assertEquals("c:181", key("Chapter 181 Side Story 2"))
+        assertEquals("c:12", key("Ch. 12 - Extra 3"))
+        // Still kinds: no chapter number first, or no number of their own.
+        assertEquals("side:3", key("Side Story 3"))
+        assertEquals("x:10", key("Chapter 10 Extra"))
+    }
+
+    @Test
     fun `words inside a chapter title do not change the kind`() {
         assertEquals("c:10", key("Chapter 10: The Extra"))
         assertEquals("c:10", key("Chapter 10 - A Special Day"))

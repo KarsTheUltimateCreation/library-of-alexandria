@@ -55,6 +55,19 @@ class ChapterQualityAnalyzer(private val ranker: SourceRanker, private val healt
         val valid = evidence.filter { !it.pages.isNullOrEmpty() }
         if (valid.isEmpty()) return emptyList()
         val maxPages = valid.maxOf { it.pages!!.size }.toDouble()
+        // Long-strip chapters (webtoons) are sliced into a different number of images per provider (the same
+        // chapter can be 16 or 165 images), so page counts say nothing about completeness. Slice heights vary too
+        // much for a couple of probes to measure length precisely (estimates were off by up to ~45% on complete
+        // chapters), so strips are only flagged when the estimated length is grossly short (a teaser, a cut-off
+        // upload); otherwise resolution, reliability and preference decide.
+        fun aspect(e: CandidateEvidence) = e.probes.filterNotNull().filter { it.width > 0 }.map { it.height.toDouble() / it.width }.average().takeIf { !it.isNaN() }
+        val stripLike = valid.any { (aspect(it) ?: 0.0) > STRIP_ASPECT }
+        val lengths = if (stripLike) valid.associateWith { e -> aspect(e)?.let { it * e.pages!!.size } } else emptyMap()
+        val maxLength = lengths.values.filterNotNull().maxOrNull()
+        fun stripCompleteness(e: CandidateEvidence): Double {
+            val ratio = lengths[e]?.let { len -> maxLength?.let { (len / it).coerceAtMost(1.0) } } ?: return 1.0
+            return if (ratio >= STRIP_TRUNCATED) 1.0 else ratio
+        }
         val prefScores = evidence.associate { it.release to ranker.score(it.release, settings) }
         val prefMin = prefScores.values.minOrNull() ?: 0.0
         val prefMax = prefScores.values.maxOrNull() ?: 0.0
@@ -66,7 +79,7 @@ class ChapterQualityAnalyzer(private val ranker: SourceRanker, private val healt
             val notes = mutableListOf<String>()
             val pages = e.pages!!
             val distinct = pages.map { it.imageUrl.substringBefore('#') }.toSet().size
-            var completeness = pages.size / maxPages
+            var completeness = if (stripLike) stripCompleteness(e) else pages.size / maxPages
             if (distinct < pages.size) {
                 completeness *= distinct.toDouble() / pages.size
                 notes += "${pages.size - distinct} duplicate page(s)"
@@ -102,9 +115,21 @@ class ChapterQualityAnalyzer(private val ranker: SourceRanker, private val healt
                 QualityMode.DATA_SAVER -> listOf(0.45, 0.30, 0.15, 0.10)
             }
             var score = wc * completeness + wq * quality + wr * reliability + wp * pref
-            if (completeness < 0.9) { score *= 0.6; notes += "incomplete (%d/%d pages)".format(pages.size, maxPages.toInt()) }
+            if (completeness < 0.9) {
+                score *= 0.6
+                notes += if (stripLike) "incomplete (~%.0f%% of strip length)".format(completeness * 100)
+                else "incomplete (%d/%d pages)".format(pages.size, maxPages.toInt())
+            }
             if (e.firstPageReachable == false) { score *= 0.3; notes += "first page unreadable" }
             QualityVerdict(e.release, score, completeness, notes)
         }.sortedByDescending { it.score }
+    }
+
+    private companion object {
+        /** Height/width above which images are long-strip slices rather than single pages. */
+        const val STRIP_ASPECT = 2.0
+
+        /** Estimated strip length below this fraction of the longest candidate counts as truncated. */
+        const val STRIP_TRUNCATED = 0.4
     }
 }

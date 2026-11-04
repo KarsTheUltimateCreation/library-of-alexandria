@@ -73,7 +73,7 @@ core/                         pure Kotlin/JVM, unit-testable, no Android APIs
   quality/                    ImageProbe (dimensions from the first bytes, Range requests)
   fallback/                   ReaderResolver (per-chapter selection), FallbackInterceptor (image-level)
   metadata/                   MangaBakaClient, AniListClient, MetadataResolver
-  sources/                    SourceAdapter, SourceRegistry, adapters/{MangaDex,WeebCentral,MangaPill}
+  sources/                    SourceAdapter, SourceRegistry, adapters/{MangaDex,WeebCentral,MangaPill,MangaKatana,MangaRead,Mgeko,Atsumaru}
   cache/                      CacheManager over a KeyValueStore
   Aggregator.kt               orchestration used by the extension
 extension/                    Android app module: HttpSource + ConfigurableSource glue, settings, icon
@@ -112,6 +112,10 @@ equally good candidates from one provider → no automatic link (ambiguous). Use
 confidence). With optimisation on, the top 2–3 candidates' page lists are fetched in parallel and 1–2
 images per candidate are probed with a 48 KB Range request for dimensions and file size. Completeness
 dominates the score; duplicate pages and unreachable first pages are penalised. The decision is cached.
+For long-strip chapters (probed height/width > 2) page counts are not compared: providers slice the same
+strip into very different numbers of images (16 to 165 for one chapter, measured). A strip is only marked
+incomplete when its estimated length (images × probed aspect) is under 40% of the longest candidate's,
+since two probes cannot measure it more precisely.
 
 **Image-level fallback.** Image URLs carry a fragment (`#loa-p=…`, never sent to servers). The interceptor
 on the extension client retries a failed page with the same index from the next release *only when the

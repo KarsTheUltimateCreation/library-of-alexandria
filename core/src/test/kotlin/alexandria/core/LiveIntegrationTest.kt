@@ -52,11 +52,14 @@ class LiveIntegrationTest {
     fun `adapters search and list chapters`() = runBlocking {
         live()
         val agg = aggregator()
+        // mgeko carries mostly manhwa/manhua (no One Piece).
+        val queries = mapOf("mgeko" to "Omniscient Reader's Viewpoint")
         for (adapter in agg.registry.all) {
-            val hits = adapter.search("One Piece")
+            val query = queries[adapter.id] ?: "One Piece"
+            val hits = adapter.search(query)
             println("${adapter.id}: ${hits.size} hits -> ${hits.take(3).map { it.title + " [" + it.id + "]" }}")
             assertTrue(hits.isNotEmpty(), "${adapter.id} search returned nothing")
-            val target = hits.first { it.title.contains("One Piece", true) }
+            val target = hits.firstOrNull { it.title.equals(query, true) } ?: hits.first { it.title.contains(query.substringBefore('\''), true) }
             val detailed = adapter.details(target)
             println("  details: alt=${detailed.altTitles.take(4)} ids=${detailed.ids} kind=${detailed.kind} status=${detailed.status}")
             val chapters = adapter.chapters(detailed, listOf("en"))

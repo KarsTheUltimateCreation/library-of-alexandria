@@ -40,7 +40,9 @@ Requires an app supporting extension lib **1.6** (Mihon 0.21+, Tachimanga 4.16+)
 | Covers | MangaBaka raw art (known dimensions), MangaDex original uploads, AniList, provider thumbnails — scored by resolution, bytes/pixel (catches upscales and over-compression), aspect, authenticity, original-language edition; fallback to the next candidate if loading fails |
 | Metadata | MangaBaka and AniList (titles, status, original chapter count, ids), cached, rate-limited, optional |
 
-Bundled providers: **MangaDex** (API, multilingual), **WeebCentral** (EN), **MangaPill** (EN).
+English only. Bundled providers: **MangaDex** (API, English chapters only), **WeebCentral**, **MangaPill**,
+**MangaKatana**, **MangaRead**, **mgeko** (mostly manhwa/manhua) and **Atsumaru** (API, several
+scanlation groups per chapter).
 See [Adding a provider](docs/ADDING_SOURCES.md).
 
 The series description ends with a short report: linked sources, recovered chapters, possible gaps,
@@ -53,7 +55,7 @@ categories):
 
 - **Covers** – high-quality covers, cover provider, prefer original artwork, automatic cover fallback
 - **Quality** – quality optimization, mode (Best / Balanced / Data saver — uses MangaDex data-saver images), prefer original resolution, quality-based switching
-- **Chapters** – deduplication, missing-chapter recovery, source fallback, specials, alternative translations, prefer official, preferred source, languages
+- **Chapters** – deduplication, missing-chapter recovery, source fallback, specials, alternative translations, prefer official, preferred source
 - **Metadata** – AniList, MangaBaka, preferred provider, completeness checking
 - **Sources** – enabled providers, provider order, manual series links (`mb:3397 = weebcentral:<id>, mangapill:-`)
 - **Performance** – concurrency, timeout, metadata cache duration, cover cache, clear cache
@@ -82,7 +84,7 @@ Read [Architecture](docs/ARCHITECTURE.md) for the research findings and design, 
 ## Credits and licence
 
 Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
-Provider parsing for WeebCentral and MangaPill and the JAR packaging are adapted from
+Provider parsing for WeebCentral, MangaPill, MangaKatana, MangaRead (Madara), mgeko and Atsumaru and the JAR packaging are adapted from
 [keiyoushi/extensions-source](https://github.com/keiyoushi/extensions-source) (Apache-2.0).
 Metadata from [MangaBaka](https://mangabaka.org) (MangaBaka-original data CC BY-NC-SA 4.0) and
 [AniList](https://anilist.co). Library of Alexandria hosts no content.

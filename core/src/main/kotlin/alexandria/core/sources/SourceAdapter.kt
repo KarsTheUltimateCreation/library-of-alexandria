@@ -68,9 +68,13 @@ abstract class HtmlAdapter(protected val ctx: AdapterContext) : SourceAdapter {
         .add("Referer", "$baseUrl/")
         .build()
 
-    protected suspend fun document(url: String): Document {
-        val html = ctx.client.fetchText(Request.Builder().url(url).headers(headers()).build(), limiter = limiter)
-        return Jsoup.parse(html, url)
+    protected suspend fun document(url: String): Document =
+        document(Request.Builder().url(url).headers(headers()).build())
+
+    /** For non-GET or custom-header requests; the base URI for relative links is the request URL. */
+    protected suspend fun document(request: Request): Document {
+        val html = ctx.client.fetchText(request, limiter = limiter)
+        return Jsoup.parse(html, request.url.toString())
     }
 
     override fun imageHeaders(imageUrl: String): Map<String, String> =

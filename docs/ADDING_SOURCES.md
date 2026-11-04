@@ -11,7 +11,7 @@ Prefer providers that are:
 - reachable without a Cloudflare challenge or login (the core runs headless; there is no WebView in the
   aggregation path),
 - stable in markup or, better, backed by a JSON API,
-- not already covered (the extra value is in coverage, quality, or language).
+- English, and not already covered (the extension is English-only; the extra value is in coverage or quality).
 
 A maintained [keiyoushi/extensions-source](https://github.com/keiyoushi/extensions-source) extension
 (Apache-2.0) is usually the best starting point. Copy the **selectors and request logic**, not the class:
@@ -25,7 +25,7 @@ class ExampleAdapter(ctx: AdapterContext) : HtmlAdapter(ctx) {
     override val id = "example"                 // [a-z0-9_]{2,32}; stored in users' data, never rename
     override val name = "Example"
     override val baseUrl = "https://example.org"
-    override val languages = setOf("en")        // null = multilingual, filtered per request
+    override val languages = setOf("en")        // the extension is English-only
     override val limiter = RateLimiter.shared("example", 2, 1_000) // be polite
 
     override suspend fun search(query: String): List<SourceSeries> = ...

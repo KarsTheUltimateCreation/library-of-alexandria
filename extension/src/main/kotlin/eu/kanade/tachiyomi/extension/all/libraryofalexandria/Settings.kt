@@ -40,7 +40,6 @@ object Settings {
     private const val ALT_TL = "agg_alt_tl"
     private const val OFFICIAL = "agg_official"
     private const val PREFERRED_SOURCE = "agg_preferred_source"
-    private const val LANGUAGES = "agg_languages"
 
     // Metadata
     private const val ANILIST = "meta_anilist"
@@ -83,7 +82,7 @@ object Settings {
             preferOfficial = b(OFFICIAL, d.preferOfficial),
             sourceOrder = list(ORDER, ""),
             preferredSource = s(PREFERRED_SOURCE, "auto").takeUnless { it == "auto" || it.isBlank() },
-            languages = list(LANGUAGES, "en"),
+            languages = listOf("en"), // the extension is English-only
             anilist = b(ANILIST, d.anilist),
             mangabaka = b(MANGABAKA, d.mangabaka),
             metadataPreference = enumOr(s(META_PREF, "AUTO"), MetadataPreference.AUTO),
@@ -167,7 +166,6 @@ object Settings {
         switch(ALT_TL, "Chapters · Show alternative translations", "List each translation group's release separately.", false)
         switch(OFFICIAL, "Chapters · Prefer official releases", "Rank releases marked official above fan translations.", true)
         list(PREFERRED_SOURCE, "Chapters · Preferred source", listOf("auto" to "Automatic") + sources, "auto")
-        text(LANGUAGES, "Chapters · Preferred languages", "Comma-separated language codes in priority order (e.g. en, es, pt-br). Empty = all.", "en")
 
         // ---- Metadata
         switch(ANILIST, "Metadata · AniList integration", "Titles, status and identity matching from AniList.", true)

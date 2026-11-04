@@ -29,6 +29,11 @@ object ChapterLabelParser {
     private val PART = Regex("""\b(?:part|pt)\s*\.?\s*(\d{1,2})\b""")
     private val PART_FRACTION = Regex("""\(\s*(\d{1,2})\s*/\s*\d{1,2}\s*\)""")
 
+    private val CHAPTER_THEN_NUMBERED_KIND = Regex(
+        """\b(?:chapter|chap|ch|episode|ep)\s*\.?\s*#?\s*\d{1,6}(?:[.,]\d{1,4})?\s*[-–—.]?\s*""" +
+            """(?:side\s*stor(?:y|ies)|gaiden|spin[\s-]?off|extras?|bonus|omake|special|sp)\s*\.?\s*#?\s*\d{1,4}\b""",
+    )
+
     private val KIND_WORDS: List<Pair<Regex, ChapterKind>> = listOf(
         Regex("""\b(?:side\s*story|side\s*stories|gaiden|spin[\s-]?off)\b""") to ChapterKind.SIDE_STORY,
         Regex("""\bprologue\b""") to ChapterKind.PROLOGUE,
@@ -139,7 +144,9 @@ object ChapterLabelParser {
             lowerTitle
         }
         var kind = tagKinds.firstOrNull()
-        if (kind == null) {
+        // "Chapter 200 Side Story 21": a kind word with its own number after "Chapter N" names a separate numbering
+        // (side story #21 *is* chapter 200), so it is a subtitle, not the kind. "Chapter 10 Extra" stays an extra.
+        if (kind == null && !CHAPTER_THEN_NUMBERED_KIND.containsMatchIn(head)) {
             kind = KIND_WORDS.firstOrNull { (re, _) -> re.containsMatchIn(head) }?.second
         }
         // A plain "Chapter 10: Special" title must not flip the kind; but "Special 2" has no chapter keyword.

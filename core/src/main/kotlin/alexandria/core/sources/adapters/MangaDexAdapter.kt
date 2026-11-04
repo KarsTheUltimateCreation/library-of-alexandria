@@ -31,7 +31,8 @@ class MangaDexAdapter(private val ctx: AdapterContext) : SourceAdapter {
     override val id = ID
     override val name = "MangaDex"
     override val baseUrl = "https://mangadex.org"
-    override val languages: Set<String>? = null
+    // English only: chapters are always requested in English, whatever the caller passes.
+    override val languages: Set<String> = setOf("en")
 
     private val api = "https://api.mangadex.org"
     private val limiter = RateLimiter.shared("mangadex", 4, 1_000)
@@ -48,6 +49,9 @@ class MangaDexAdapter(private val ctx: AdapterContext) : SourceAdapter {
         listOf("safe", "suggestive", "erotica").forEach { addQueryParameter("contentRating[]", it) }
     }
 
+    /** Only series with English chapters; others could never contribute anything. */
+    private fun HttpUrl.Builder.englishAvailable() = addQueryParameter("availableTranslatedLanguage[]", "en")
+
     override suspend fun search(query: String): List<SourceSeries> {
         val url = "$api/manga".toHttpUrl().newBuilder()
             .addQueryParameter("title", query)
@@ -55,6 +59,7 @@ class MangaDexAdapter(private val ctx: AdapterContext) : SourceAdapter {
             .addQueryParameter("includes[]", "cover_art")
             .addQueryParameter("order[relevance]", "desc")
             .contentRatings()
+            .englishAvailable()
             .build()
         return get<MdList<MdManga>>(url).data.map { it.toSeries() }
     }
@@ -71,6 +76,7 @@ class MangaDexAdapter(private val ctx: AdapterContext) : SourceAdapter {
             .addQueryParameter("order[$order]", "desc")
             .addQueryParameter("hasAvailableChapters", "true")
             .contentRatings()
+            .englishAvailable()
             .build()
         return get<MdList<MdManga>>(url).data.map { it.toSeries() }
     }
@@ -98,7 +104,7 @@ class MangaDexAdapter(private val ctx: AdapterContext) : SourceAdapter {
                 // Chapters removed from MangaDex@Home (e.g. DMCA) still list but 404 on /at-home.
                 .addQueryParameter("includeUnavailable", "0")
                 .contentRatings()
-                .apply { languages.forEach { addQueryParameter("translatedLanguage[]", it) } }
+                .addQueryParameter("translatedLanguage[]", "en")
                 .build()
             val page = get<MdList<MdChapter>>(url)
             total = page.total

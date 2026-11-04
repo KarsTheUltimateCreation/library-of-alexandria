@@ -170,6 +170,29 @@ class ChapterQualityTest {
     }
 
     @Test
+    fun `sliced webtoon strips are compared by content length not image count`() {
+        // Same chapter: "a" slices it into 70 short images, "b" into 43 taller ones of equal total length.
+        val ev = listOf(
+            CandidateEvidence(rel("a"), pages(70, "a"), listOf(ImageInfo(720, 1600, "jpeg", 150_000)), firstPageReachable = true),
+            CandidateEvidence(rel("b"), pages(43, "b"), listOf(ImageInfo(720, 2605, "jpeg", 250_000)), firstPageReachable = true),
+        )
+        val verdicts = analyzer.evaluate(ev, AggregatorSettings())
+        assertTrue(verdicts.all { it.completeness > 0.95 }, verdicts.toString())
+        // Measured live (Solo Leveling ch. 150): all three were complete (true length ~235 screens each), but
+        // two-probe estimates differed widely. None may be flagged.
+        val noisy = listOf(
+            CandidateEvidence(rel("wc"), pages(46, "w"), listOf(ImageInfo(720, 4000, "jpeg", 400_000), ImageInfo(720, 3681, "jpeg", 400_000))),
+            CandidateEvidence(rel("mk"), pages(65, "k"), listOf(ImageInfo(1774, 998, "jpeg", 200_000), ImageInfo(720, 2501, "jpeg", 200_000))),
+            CandidateEvidence(rel("mr"), pages(16, "r"), listOf(ImageInfo(719, 8485, "jpeg", 900_000), ImageInfo(720, 11002, "jpeg", 900_000))),
+        )
+        assertTrue(analyzer.evaluate(noisy, AggregatorSettings()).all { it.completeness == 1.0 })
+        // A grossly short strip (a teaser / cut-off upload) is still flagged.
+        val short = listOf(ev[0], CandidateEvidence(rel("c"), pages(8, "c"), listOf(ImageInfo(720, 2605, "jpeg", 250_000)), firstPageReachable = true))
+        assertEquals("a", analyzer.evaluate(short, AggregatorSettings()).first().release.sourceId)
+        assertTrue(analyzer.evaluate(short, AggregatorSettings()).first { it.release.sourceId == "c" }.completeness < 0.4)
+    }
+
+    @Test
     fun `higher resolution wins when both are complete`() {
         val ev = listOf(
             CandidateEvidence(rel("a"), pages(20, "a"), listOf(ImageInfo(720, 1000, "jpeg", 150_000)), firstPageReachable = true),

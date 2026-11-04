@@ -2,8 +2,12 @@ package alexandria.core.sources
 
 import alexandria.core.config.AggregatorSettings
 import alexandria.core.ranking.ProviderHealth
+import alexandria.core.sources.adapters.AtsumaruAdapter
 import alexandria.core.sources.adapters.MangaDexAdapter
+import alexandria.core.sources.adapters.MangaKatanaAdapter
 import alexandria.core.sources.adapters.MangaPillAdapter
+import alexandria.core.sources.adapters.MangaReadAdapter
+import alexandria.core.sources.adapters.MgekoAdapter
 import alexandria.core.sources.adapters.WeebCentralAdapter
 
 /**
@@ -36,7 +40,8 @@ class SourceRegistry(private val adapters: List<SourceAdapter>, val health: Prov
         val ID_PATTERN = Regex("^[a-z0-9_]{2,32}$")
 
         fun defaults(ctx: AdapterContext, health: ProviderHealth) = SourceRegistry(
-            listOf(MangaDexAdapter(ctx), WeebCentralAdapter(ctx), MangaPillAdapter(ctx)),
+            listOf(MangaDexAdapter(ctx), WeebCentralAdapter(ctx), MangaPillAdapter(ctx), MangaKatanaAdapter(ctx), MangaReadAdapter(ctx),
+                MgekoAdapter(ctx), AtsumaruAdapter(ctx)),
             health,
         )
     }

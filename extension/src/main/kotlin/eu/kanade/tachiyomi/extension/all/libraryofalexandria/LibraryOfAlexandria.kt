@@ -46,7 +46,9 @@ import uy.kohesive.injekt.api.get
 class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
 
     override val name = "Library of Alexandria"
-    override val lang = "all"
+    /** English only. Published as "all" until 1.6.3; [id] keeps that original value so libraries stay attached. */
+    override val lang = "en"
+    override val id: Long = BuildConfig.SOURCE_ID
     override val baseUrl = "https://mangabaka.org"
     override val supportsLatest = true
 
