@@ -32,10 +32,17 @@ object SearchClusterer {
         rejected: (SourceSeries, SourceSeries) -> Boolean,
         priority: (String) -> Int,
         canAnchor: (String) -> Boolean,
-        /** Providers of different roles (series sites, gallery sites) are never grouped. */
-        roleOf: (String) -> Any? = { null },
+        /** Entries of different roles (series sites, single galleries) are never grouped. */
+        roleOf: (SourceSeries) -> Any? = { null },
+        /**
+         * How well an entry's own title answers the search. Within one site, better answers are placed first, so a
+         * site's "Tower of God" takes its place in the result before its "Tower of God (Book Version)" (whose aliases
+         * include the plain title) can.
+         */
+        relevance: (SourceSeries) -> Double = { 0.0 },
     ): List<SearchCluster> {
-        val ordered = hits.distinctBy { it.sourceId to it.id }.sortedBy { priority(it.sourceId) }
+        val ordered = hits.distinctBy { it.sourceId to it.id }
+            .sortedWith(compareBy<SourceSeries> { priority(it.sourceId) }.thenByDescending { relevance(it) })
         val clusters = mutableListOf<MutableList<SourceSeries>>()
         val keys = mutableListOf<String?>()
 
@@ -48,9 +55,13 @@ object SearchClusterer {
         // 2. Everything else joins a compatible result or starts its own.
         for (h in ordered) {
             if (keyOf(h) != null) continue
-            val i = clusters.indices.firstOrNull { c -> clusters[c].all { roleOf(it.sourceId) == roleOf(h.sourceId) } && compatible(clusters[c], h, rejected) }
+            val i = clusters.indices.firstOrNull { c -> clusters[c].all { roleOf(it) == roleOf(h) } && compatible(clusters[c], h, rejected) }
             if (i != null) {
                 clusters[i] += h
+            } else if (clusters.any { c -> c.all { roleOf(it) == roleOf(h) } && copyOnSameSite(c, h, rejected) }) {
+                // A site listing one series twice (MangaFire's "Golden Mage" ×2, Hitomi's chapters uploaded as galleries
+                // of one name): the second entry is not shown. Opening the result links the site's best entry.
+                continue
             } else if (canAnchor(h.sourceId)) {
                 clusters += mutableListOf(h); keys += null
             }
@@ -65,26 +76,66 @@ object SearchClusterer {
 
     private fun compatible(cluster: List<SourceSeries>, h: SourceSeries, rejected: (SourceSeries, SourceSeries) -> Boolean): Boolean {
         if (cluster.any { it.sourceId == h.sourceId }) return false
-        if (cluster.any { contradicts(it, h) || rejected(it, h) || rejected(h, it) }) return false
+        // Authors in common with one member outweigh differently romanised names on another ("Hanjung Wolya" here,
+        // "Han-Joong-Wueol-Ya" there): sites credit the same people under many spellings.
+        val authorsAgree = cluster.any { sameAuthors(it, h) }
+        if (cluster.any { contradicts(it, h, checkAuthors = !authorsAgree) || rejected(it, h) || rejected(h, it) }) return false
         return cluster.any { sameTitle(it, h) || it.ids.compare(h.ids) == 1 }
     }
 
-    private fun sameTitle(a: SourceSeries, b: SourceSeries): Boolean =
-        TitleNormalizer.compact(a.title) == TitleNormalizer.compact(b.title) &&
-            TitleNormalizer.qualifiers(a.title) == TitleNormalizer.qualifiers(b.title)
+    /** [h] has exactly the main title of a member from its own site, and nothing in the result contradicts it. */
+    private fun copyOnSameSite(cluster: List<SourceSeries>, h: SourceSeries, rejected: (SourceSeries, SourceSeries) -> Boolean): Boolean {
+        val twin = cluster.firstOrNull {
+            it.sourceId == h.sourceId && TitleNormalizer.compact(it.title) == TitleNormalizer.compact(h.title) &&
+                TitleNormalizer.qualifiers(it.title) == TitleNormalizer.qualifiers(h.title)
+        } ?: return false
+        return cluster.none { contradicts(it, h) || rejected(it, h) || rejected(h, it) } && twin.kind.let { k -> k == h.kind || k == ContentKind.UNKNOWN || h.kind == ContentKind.UNKNOWN }
+    }
+
+    /**
+     * One entry's main title is the other's main title or one of its alternative titles ("30 Years Since the Prologue"
+     * listed by one site, "30 Years Have Passed Since the Prologue" with the first as an alt title by another). Same
+     * edition qualifiers required; very short titles only match exactly.
+     */
+    internal fun sameTitle(a: SourceSeries, b: SourceSeries): Boolean {
+        fun mainIn(x: SourceSeries, y: SourceSeries): Boolean {
+            val main = TitleNormalizer.compact(x.title)
+            if (main.isEmpty()) return false
+            val quals = TitleNormalizer.qualifiers(x.title)
+            return y.allTitles().any { t ->
+                val c = TitleNormalizer.compact(t)
+                c == main && TitleNormalizer.qualifiers(t) == quals && (t == y.title || main.length >= MIN_ALT_MATCH)
+            }
+        }
+        return mainIn(a, b) || mainIn(b, a)
+    }
+
+    /** Shortest compact title that may match through an alternative title (short ones are too often shared). */
+    private const val MIN_ALT_MATCH = 8
+
+    private fun sameAuthors(a: SourceSeries, b: SourceSeries): Boolean {
+        val aa = IdentityResolver.realAuthors(a.authors)
+        val ba = IdentityResolver.realAuthors(b.authors)
+        return aa.isNotEmpty() && ba.isNotEmpty() && (IdentityResolver.authorsOverlap(aa, ba) || IdentityResolver.authorsAlike(aa, ba))
+    }
 
     /** Evidence that two entries are different works. */
-    fun contradicts(a: SourceSeries, b: SourceSeries): Boolean {
+    fun contradicts(a: SourceSeries, b: SourceSeries, checkAuthors: Boolean = true): Boolean {
         if (a.ids.compare(b.ids) == -1) return true
         if (a.kind != ContentKind.UNKNOWN && b.kind != ContentKind.UNKNOWN && (a.kind == ContentKind.NOVEL) != (b.kind == ContentKind.NOVEL)) return true
         val ya = a.year
         val yb = b.year
         if (ya != null && yb != null && kotlin.math.abs(ya - yb) > 3) return true
-        if (a.authors.isNotEmpty() && b.authors.isNotEmpty() && (a.authors + b.authors).all { n -> n.all { !it.isLetter() || it.code < 0x250 } } &&
-            !IdentityResolver.authorsOverlap(a.authors, b.authors)
+        val aa = IdentityResolver.realAuthors(a.authors)
+        val ba = IdentityResolver.realAuthors(b.authors)
+        // Korean and Chinese names have no single romanisation ("Supp" / "Seop-I", "Coul" / "Krukru"): differing Latin
+        // credits prove nothing for manhwa and manhua.
+        val romanised = a.kind == ContentKind.MANHWA || a.kind == ContentKind.MANHUA || b.kind == ContentKind.MANHWA || b.kind == ContentKind.MANHUA
+        if (checkAuthors && !romanised && aa.isNotEmpty() && ba.isNotEmpty() && (aa + ba).all { n -> n.all { !it.isLetter() || it.code < 0x250 } } &&
+            !IdentityResolver.authorsOverlap(aa, ba) && !IdentityResolver.authorsAlike(aa, ba)
         ) {
-            val wa = a.authors.flatMap { TitleNormalizer.normalize(it).split(' ') }.filter { it.length >= 3 }.toSet()
-            if (b.authors.flatMap { TitleNormalizer.normalize(it).split(' ') }.none { it.length >= 3 && it in wa }) return true
+            val wa = aa.flatMap { TitleNormalizer.normalize(it).split(' ') }.filter { it.length >= 3 }.toSet()
+            if (ba.flatMap { TitleNormalizer.normalize(it).split(' ') }.none { it.length >= 3 && it in wa }) return true
         }
         return false
     }

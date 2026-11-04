@@ -40,7 +40,7 @@ class MangaBallAdapter(private val ctx: AdapterContext, override val baseUrl: St
     override val id = ID
     override val name = "Manga Ball"
     override val languages: Set<String> = setOf("en")
-    override val imageHosts = setOf("red-and-blue.net")
+    override val imageHosts = setOf("red-and-blue.net", "hencover.xyz", "mancover.xyz")
     private val limiter = RateLimiter.shared(ID, 2, 1_000)
 
     @Serializable
@@ -173,7 +173,16 @@ class MangaBallAdapter(private val ctx: AdapterContext, override val baseUrl: St
         return pages.mapIndexed { i, u -> ReaderPage(i, u, imageHeaders(u)) }
     }
 
-    override fun imageHeaders(imageUrl: String) = mapOf("Referer" to "$baseUrl/", "User-Agent" to ctx.browserUserAgent)
+    /**
+     * Its hentai and manhwa covers (hencover.xyz, mancover.xyz) answer 403 to any Referer, an empty one included only as "none": the Referer is
+     * blanked for them (the host's default Referer would otherwise be sent).
+     */
+    override fun imageHeaders(imageUrl: String) =
+        if (NO_REFERER_HOSTS.any { "://$it/" in imageUrl || ".$it/" in imageUrl }) mapOf("Referer" to "", "User-Agent" to ctx.browserUserAgent)
+        else mapOf("Referer" to "$baseUrl/", "User-Agent" to ctx.browserUserAgent)
+
+    /** Google image previews are about 180x275; its other covers vary. */
+    override fun coverPixels(coverUrl: String) = if ("gstatic.com" in coverUrl) 180L * 275 else 400L * 600
 
     override fun seriesWebUrl(seriesId: String) = "$baseUrl/title-detail/$seriesId"
 
@@ -183,9 +192,12 @@ class MangaBallAdapter(private val ctx: AdapterContext, override val baseUrl: St
         return SourceSeries(
             sourceId = ID, id = id, title = name.trim(),
             altTitles = alternateName.map { it.trim() }.filter { it.isNotEmpty() && !it.equals(name, true) },
-            // Covers on the challenged host would not load; MangaDex's CDN rejects other sites' requests.
+            // Covers on the challenged host would not load; MangaDex's CDN rejects other sites' requests. Google image
+            // previews (encrypted-tbn*.gstatic.com, ~180x275) are used only when nothing else is offered.
             coverUrl = listOfNotNull(image?.file, image?.cdnMangaupdate, image?.cdnMangaupdates)
-                .firstOrNull { it.startsWith("http") && CHALLENGED_HOSTS.none { h -> h in it } && "mangadex" !in it },
+                .filter { it.startsWith("http") && CHALLENGED_HOSTS.none { h -> h in it } && "mangadex" !in it }
+                .sortedBy { "gstatic.com" in it }
+                .firstOrNull(),
             ids = ExternalIds(mangadex = mangadex),
             kind = ContentKind.parse(type),
             status = PublicationStatus.parse(status),
@@ -203,6 +215,7 @@ class MangaBallAdapter(private val ctx: AdapterContext, override val baseUrl: St
         private val JSON = "application/json".toMediaType()
         private val CHALLENGED_STORAGE = setOf("cdn_1")
         private val CHALLENGED_HOSTS = setOf("poke-black-and-white.net")
+        private val NO_REFERER_HOSTS = setOf("hencover.xyz", "mancover.xyz")
         private val UUID = Regex("^[0-9a-f-]{36}$")
     }
 }

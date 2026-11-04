@@ -50,7 +50,8 @@ class MangaReadAdapter(ctx: AdapterContext, override val baseUrl: String = "http
                 sourceId = id,
                 id = slug,
                 title = a.text().takeIf { it.isNotBlank() } ?: return@mapNotNull null,
-                coverUrl = el.selectFirst("img")?.imageUrl(),
+                // Listings link WordPress-resized thumbnails (193x278); the uploaded original is at the same path.
+                coverUrl = el.selectFirst("img")?.imageUrl()?.let(::fullSizeCover),
                 webUrl = seriesWebUrl(slug),
             )
         }.distinctBy { it.id }
@@ -64,7 +65,7 @@ class MangaReadAdapter(ctx: AdapterContext, override val baseUrl: String = "http
             id = slug,
             title = a.text().takeIf { it.isNotBlank() } ?: return null,
             altTitles = splitAlt(item("mg_alternative")?.text()),
-            coverUrl = el.selectFirst(".tab-thumb img")?.imageUrl(),
+            coverUrl = el.selectFirst(".tab-thumb img")?.imageUrl()?.let(::fullSizeCover),
             authors = item("mg_author")?.select("a")?.map { it.text() }.orEmpty(),
             status = PublicationStatus.parse(item("mg_status")?.text()),
             year = el.selectFirst(".post-content_item.mg_release .summary-content, .release-year")?.text()?.trim()?.toIntOrNull(),

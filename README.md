@@ -33,7 +33,7 @@ Requires an app supporting extension lib **1.6** (Mihon 0.21+, Tachimanga 4.16+)
 
 | Feature | How |
 |---|---|
-| Multi-source search | The five most relevant healthy providers first (all of them when they find little, or when you scroll past the end of the results); the results page never waits more than 6 s for a provider. With external metadata enabled, MangaBaka (or AniList) is searched too |
+| Multi-source search | The five most relevant healthy providers first (all of them when they find little, or when you scroll past the end of the results); the results page never waits more than 6 s for a provider — unless nothing was found, when every remaining provider is asked with up to 15 s before reporting no results (a bulk migration searches while the library updates). One series is one result even when sites name it differently (one site's title is another's alternative title), a site lists it twice, or credits its authors under other spellings; each result is named after the title closest to the search. With external metadata enabled, MangaBaka (or AniList) is searched too |
 | Sources per series | At most 5 linked sources are read from and refreshed per series; further confirmed matches are kept as *spares* and promoted without a new search when a linked source fails or chapters are missing. Older series with more links are trimmed only of sources that add no chapter of their own — the cap never costs a chapter |
 | Request control | Each service's request rate adapts: a 429 halves it, it recovers gradually once the 429s stop. Library updates refresh the two providers furthest ahead on every update and the other linked ones at most every 6 h; searches made by library updates draw on a shared per-provider budget (6/min) and widen to every provider at most twice a day per series; identical provider searches and detail lookups are shared between search, linking and updates for 20 min |
 | Speed | Per-request network timeouts adapt to each provider's measured latency and start only when a request is actually sent; a failing provider cools down (2 → 30 min); a service's `Retry-After` (seconds or HTTP date) pauses every caller of that service instead of being retried early; recent chapter lists are reused instead of refetched; identical concurrent requests are merged |
@@ -46,7 +46,7 @@ Requires an app supporting extension lib **1.6** (Mihon 0.21+, Tachimanga 4.16+)
 | Per-chapter quality | Top candidates' page lists and a few image headers (48 KB range requests) are compared: completeness first, then resolution/compression, reliability, preference |
 | Fallback | A failing *or timing-out* provider → next release; a stalled candidate never holds up the per-chapter comparison; a failing page image — including one whose download breaks off after it started — → same page from another release with the same page count |
 | Offline resilience | Provider links and the last known chapter list of each linked provider survive app restarts (bounded); an outage keeps the chapters you already have instead of removing them |
-| Covers | Every linked source's cover (plus MangaBaka raw art / AniList when enabled) is measured at once — first 64 KB only, one 2.5 s budget, alongside the chapter list so it adds no wait — and sizes are remembered for 30 days; the highest resolution wins, scored by resolution, bytes/pixel (catches upscales and over-compression), aspect, authenticity, original-language edition; fallback to the next candidate if loading fails |
+| Covers | Search results show the sharpest cover among the sites carrying the series (measured sizes, else each site's typical size; Google preview thumbnails last). Every linked source's cover (plus MangaBaka raw art / AniList when enabled) is measured at once — first 64 KB only, one 2.5 s budget, alongside the chapter list so it adds no wait — and sizes are remembered for 30 days; the highest resolution wins, scored by resolution, bytes/pixel (catches upscales and over-compression), aspect, authenticity, original-language edition; fallback to the next candidate if loading fails |
 | External metadata | Off by default. MangaBaka and/or AniList (catalogue details, original chapter count, catalogue filters and popular lists), cached and rate-limited, when enabled |
 
 English only, 18+ content included. Bundled providers:
@@ -61,6 +61,9 @@ English only, 18+ content included. Bundled providers:
   when it is adult content. ManhwaRead and Hentai2Read sit behind Cloudflare and need the app to solve the challenge.
 - **Galleries** (doujinshi, one-shots): NHentai, Hitomi, E-Hentai and Pururin — English galleries only, shown as
   their own search results (one chapter each), never searched to link catalogue series.
+- **Numbered parts** ("Title", "Title 2", "Title 3" …) published as separate entries on the gallery sites, Hentai2Read
+  and Manga Ball ("[H]" titles) are shown as one series whose chapters are the parts, combined across those sites;
+  new parts are picked up when the chapter list refreshes.
 
 See [Adding a provider](docs/ADDING_SOURCES.md).
 

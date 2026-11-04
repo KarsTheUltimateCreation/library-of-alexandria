@@ -92,11 +92,14 @@ class SourceRegistry(private val adapters: List<SourceAdapter>, val health: Prov
                 // Added in 1.6.6 (ids namespaced "loa_"); progressive discovery asks them when the others fall short.
                 AsuraScansAdapter(ctx), MangaTownAdapter(ctx),
                 // Added in 1.6.8.
-                MangaFireAdapter(ctx), MangaTaroAdapter(ctx), FlameComicsAdapter(ctx), MangaBallAdapter(ctx),
+                MangaFireAdapter(ctx), MangaTaroAdapter(ctx), FlameComicsAdapter(ctx),
+                // Manga Ball lists each part of a hentai series ("[H] Title 3") as its own title: shown as one series.
+                VolumeGroupingAdapter(MangaBallAdapter(ctx)) { it.title.trimStart().startsWith("[H]", ignoreCase = true) },
                 // Adult series providers: searched to link a catalogue series only when it is adult content.
-                HiperdexAdapter(ctx), OmegaScansAdapter(ctx), ManhwaReadAdapter(ctx), Hentai20Adapter(ctx), Hentai2ReadAdapter(ctx),
-                // Gallery sites (one-shots, doujinshi): standalone search results only.
-                NHentaiAdapter(ctx), HitomiAdapter(ctx), EHentaiAdapter(ctx), PururinAdapter(ctx)),
+                HiperdexAdapter(ctx), OmegaScansAdapter(ctx), ManhwaReadAdapter(ctx), Hentai20Adapter(ctx), VolumeGroupingAdapter(Hentai2ReadAdapter(ctx)),
+                // Gallery sites (one-shots, doujinshi): standalone search results only; numbered parts form one series.
+                VolumeGroupingAdapter(NHentaiAdapter(ctx)), VolumeGroupingAdapter(HitomiAdapter(ctx)),
+                VolumeGroupingAdapter(EHentaiAdapter(ctx)), VolumeGroupingAdapter(PururinAdapter(ctx))),
             health,
         )
     }

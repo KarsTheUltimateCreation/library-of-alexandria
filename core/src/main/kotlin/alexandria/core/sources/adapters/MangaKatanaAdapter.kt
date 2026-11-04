@@ -114,6 +114,9 @@ class MangaKatanaAdapter(ctx: AdapterContext, override val baseUrl: String = "ht
             .mapIndexed { i, src -> ReaderPage(i, src, imageHeaders(src)) }.toList()
     }
 
+    /** Its covers are small (230x333). */
+    override fun coverPixels(coverUrl: String) = 230L * 333
+
     override fun seriesWebUrl(seriesId: String) = "$baseUrl/manga/$seriesId"
 
     private fun seriesIdFrom(url: String): String? =

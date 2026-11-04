@@ -42,6 +42,7 @@ import alexandria.core.reconciliation.Release
 import alexandria.core.sources.ProviderRole
 import alexandria.core.sources.SourceAdapter
 import alexandria.core.sources.SourceRegistry
+import alexandria.core.sources.VolumeSeries
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
@@ -210,7 +211,8 @@ class Aggregator(
         val fresh = searchCache[cacheKey]?.takeIf { clock() - it.at < SEARCH_CACHE_MS }
         val first = fresh ?: searchFirstPage(q, settings, searchCache[cacheKey]).also {
             if (searchCache.size > 50) searchCache.clear()
-            searchCache[cacheKey] = it
+            // An empty page is not kept: asking again (the user retrying a title a migration missed) searches again.
+            if (it.cards.isNotEmpty()) searchCache[cacheKey] = it
         }
         if (page <= 1) return first.cards to first.more
         if (!first.more) return emptyList<SeriesCard>() to false
@@ -259,10 +261,27 @@ class Aggregator(
             hits = hits + searchProviders(listOf(query), settings, widen, deadlineMs = SEARCH_DEADLINE_MS)
             searched = searched + widen.map { it.id }
         }
+        var cards = rankFirstPage(query, hits, metas, settings)
+        if (cards.isEmpty()) {
+            // Nothing at all. Under load (a bulk migration searches title after title while those series are being
+            // updated) the providers asked may have been busy, cooling down or cut off by the deadline, and "no results"
+            // makes the host report the title as missing. Ask every enabled provider that has not answered, with more
+            // time, before reporting nothing.
+            val rest = registry.enabled(settings).filter { it.id !in hits.keys }
+            if (rest.isNotEmpty()) {
+                hits = hits + searchProviders(listOf(query), settings, rest, deadlineMs = RESCUE_DEADLINE_MS)
+                searched = searched + rest.map { it.id }
+                cards = rankFirstPage(query, hits, metas, settings)
+            }
+        }
         hits.forEach { (sid, list) -> list.forEach { registry.noteImage(it.coverUrl, sid) } }
         // Every provider failed (offline, outage): show the last results instead of nothing.
-        if (hits.isEmpty() && metas.isEmpty() && stale != null) return@coroutineScope stale
+        if (cards.isEmpty() && stale != null) return@coroutineScope stale
+        SearchPage(clock(), cards, hits, searched, more = searched.size < tier1.size + tier2.size)
+    }
 
+    /** Catalogue records and provider hits of a first search page as ranked, de-duplicated cards. */
+    private fun rankFirstPage(query: String, hits: Map<String, List<SourceSeries>>, metas: List<SeriesMetadata>, settings: AggregatorSettings): List<SeriesCard> {
         val claimed = mutableSetOf<Pair<String, String>>()
         val ranked = mutableListOf<Ranked>()
         for (m in metas) {
@@ -278,8 +297,7 @@ class Aggregator(
             ranked += Ranked(card, score, ranked.size)
         }
         ranked += providerCards(query, hits, settings, claimed).map { Ranked(it.card, it.score, ranked.size + it.order) }
-        val cards = ranked.sortedWith(compareByDescending<Ranked> { it.score }.thenBy { it.order }).map { it.card }.distinctBy { it.key.value }
-        SearchPage(clock(), cards, hits, searched, more = searched.size < tier1.size + tier2.size)
+        return ranked.sortedWith(compareByDescending<Ranked> { it.score }.thenBy { it.order }).map { it.card }.distinctBy { it.key.value }
     }
 
     private fun relevantTitles(query: String, hits: Map<String, List<SourceSeries>>): Int =
@@ -299,7 +317,9 @@ class Aggregator(
             rejected = { a, b -> (indexedKey(a) ?: SeriesKey.Provider(a.sourceId, a.id).value) in rejectedBy(b) },
             priority = { sid -> registry.all.indexOfFirst { it.id == sid }.let { if (it < 0) Int.MAX_VALUE else it } },
             canAnchor = { sid -> registry[sid]?.standaloneResults != false },
-            roleOf = { sid -> registry[sid]?.role },
+            // Numbered parts folded into one series are a series, whichever kind of site they came from.
+            roleOf = { s -> if (VolumeSeries.isComposite(s.id)) ProviderRole.SERIES else registry[s.sourceId]?.role },
+            relevance = { s -> SearchRelevance.score(query, s.title) },
         )
         return clusters.mapIndexed { i, c ->
             val anchor = c.anchor
@@ -307,13 +327,35 @@ class Aggregator(
             if (c.key == null) {
                 rememberHints(key, null, c.members.associate { it.sourceId to Binding(it, if (it == anchor) 1.0 else 0.8, "search title", hint = it != anchor) })
             }
-            // The sharpest cover measured earlier (no request), else the preferred source's.
-            val byPreference = c.members.sortedWith(compareByDescending<SourceSeries> { knownPixels(it.coverUrl) }.thenBy { settings.sourceRank(it.sourceId) })
+            // The sharpest cover: measured earlier (no request), else each source's typical cover size; then preference.
+            val byPreference = c.members.sortedWith(compareByDescending<SourceSeries> { coverPixels(it) }.thenBy { settings.sourceRank(it.sourceId) })
             val cover = c.key?.let { bestKnownCover(it) }?.takeIf { settings.externalMetadata || METADATA_PROVIDERS.none { m -> m in it } }
                 ?: byPreference.filter { registry[it.sourceId]?.standaloneResults != false }.firstNotNullOfOrNull { it.coverUrl }
-            val title = c.key?.let { storedTitle(it) } ?: anchor.title
+            // A grouped result is shown under the name closest to what was searched: sites name one series differently
+            // ("Apocalypse Bringer Mynoghra" / "… - World Conquest Begins with …"), and hosts match migrations on it.
+            val title = c.key?.let { storedTitle(it) } ?: closestTitle(query, c.members) ?: anchor.title
             Ranked(SeriesCard(key, title, cover, anchor), SearchRelevance.score(query, c.members.flatMap { it.allTitles() }), i)
         }
+    }
+
+    /**
+     * The members' main title that best answers [query], or an alternative title that equals it exactly. Null when the
+     * anchor's own title is as good.
+     */
+    private fun closestTitle(query: String, members: List<SourceSeries>): String? {
+        // Word for word: some sites list run-together search aliases ("kaijuno 8", "towerof god") as titles.
+        val q = TitleNormalizer.normalize(query)
+        members.map { it.title }.firstOrNull { TitleNormalizer.normalize(it) == q }?.let { return it }
+        members.flatMap { it.altTitles }.firstOrNull { TitleNormalizer.normalize(it) == q }?.let { return it }
+        val anchor = members.first().title
+        val best = members.map { it.title }.maxByOrNull { SearchRelevance.score(query, it) } ?: return null
+        return best.takeIf { SearchRelevance.score(query, it) > SearchRelevance.score(query, anchor) }
+    }
+
+    /** Pixel area of a hit's cover: measured earlier when known, else the provider's typical size. */
+    private fun coverPixels(s: SourceSeries): Long {
+        val url = s.coverUrl ?: return 0L
+        return knownPixels(url).takeIf { it > 0 } ?: registry[s.sourceId]?.coverPixels(url) ?: 0L
     }
 
     /**
@@ -810,6 +852,22 @@ class Aggregator(
             }
         }
 
+        // Numbered parts grouped on several sites (a doujinshi series on Manga Ball, Hitomi and nhentai): a part series
+        // elsewhere that shares a base title is the same set of parts; there is nothing else to compare.
+        val partsAnchor = (key as? SeriesKey.Provider)?.takeIf { VolumeSeries.isComposite(it.seriesId) }?.let { state.bindings[it.sourceId]?.series }
+        if (partsAnchor != null) {
+            val bases = partsAnchor.allTitles().map { TitleNormalizer.compact(it) }.filter { it.length >= 4 }.toSet()
+            state = state.copy(
+                bindings = state.bindings.mapValues { (_, b) ->
+                    if (b.unverified && VolumeSeries.isComposite(b.series.id) && b.series.allTitles().any { TitleNormalizer.compact(it) in bases }) {
+                        b.copy(confidence = 0.9, reason = "same numbered parts", hint = false)
+                    } else {
+                        b
+                    }
+                },
+            )
+        }
+
         // Links pre-made from search results are title-only. Verify them with provider details (year, authors,
         // tracker ids, alt titles) before trusting them, exactly like a normal match.
         // Gallery copies were grouped by exact title in search; galleries carry no ids or years to verify against.
@@ -1239,6 +1297,9 @@ class Aggregator(
 
     private companion object {
         const val SEARCH_DEADLINE_MS = 6_000L
+
+        /** Deadline of the last-resort search of every remaining provider when a first page found nothing. */
+        const val RESCUE_DEADLINE_MS = 15_000L
         const val SEARCH_CACHE_MS = 10 * CacheManager.MINUTE
         const val BROWSE_PAGE_SIZE = 30
 

@@ -11,7 +11,7 @@ object TitleNormalizer {
      */
     val EDITION_QUALIFIERS: Map<Regex, String> = linkedMapOf(
         Regex("""\b(?:light\s*novel|web\s*novel|novel|ln|wn)\b""") to "novel",
-        Regex("""\bvolume\s*version\b|\(volume\)""") to "volume-version",
+        Regex("""\b(?:volume|book)\s*version\b|\(volume\)""") to "volume-version",
         Regex("""\b(?:fan\s*)?colou?red(?:\s*edition)?\b|\bfull\s*colou?r\b""") to "colored",
         Regex("""\bdoujin(?:shi)?\b""") to "doujinshi",
         Regex("""\banthology\b""") to "anthology",

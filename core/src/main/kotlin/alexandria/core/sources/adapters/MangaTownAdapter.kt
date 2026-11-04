@@ -124,6 +124,9 @@ class MangaTownAdapter(ctx: AdapterContext, override val baseUrl: String = "http
         return day.atStartOfDay().toInstant(ZoneOffset.UTC).toEpochMilli()
     }
 
+    /** Its covers are small (200x290). */
+    override fun coverPixels(coverUrl: String) = 200L * 290
+
     override fun seriesWebUrl(seriesId: String) = "$baseUrl/manga/$seriesId/"
 
     companion object {

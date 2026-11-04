@@ -196,6 +196,9 @@ class AsuraScansAdapter(
 
     override fun imageHeaders(imageUrl: String): Map<String, String> = mapOf("Referer" to "$baseUrl/", "User-Agent" to ctx.browserUserAgent)
 
+    /** Full-size artwork (about 1100x1400). */
+    override fun coverPixels(coverUrl: String) = 1100L * 1400
+
     override fun seriesWebUrl(seriesId: String) = "$baseUrl/comics/$seriesId"
 
     companion object {

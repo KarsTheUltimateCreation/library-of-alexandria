@@ -115,6 +115,30 @@ best title pair across all variants must score ≥ 0.90, with penalties for edit
 ("Novel", "Volume Version", "Colored", "Doujinshi"…), novel-vs-comic, year gaps and short titles. Two
 equally good candidates from one provider → no automatic link (ambiguous). Users can link manually.
 
+**Search grouping.** Provider hits form one result when one's main title is the other's main *or alternative*
+title (same edition qualifiers; compact titles under 8 characters only main-to-main), and nothing contradicts. Author
+lists contradict only when no name is shared or near-identical (≥ 80 % edit similarity: "Mak Ellaha" ~ "Markellaha"),
+and not at all when the hit already shares authors with another member of the result (sites romanise Korean names
+differently). Placeholder credits ("Bot", "Updating", "N/A") are ignored, and for manhwa and manhua differing Latin
+credits are never a contradiction (no single romanisation: "Supp" / "Seop-I"). A site's second entry with exactly the
+same title as one already in a result (MangaFire and Atsumaru list some series twice, Hitomi uploads chapters as
+same-named galleries) is not shown; within a site, the entry whose own title best answers the search is placed first,
+so an edition ("Book Version", whose aliases include the plain title) cannot take the plain entry's place. A result is
+named after the member title closest to the query (word for word for aliases: some sites list run-together search
+aliases), since hosts match migrations on it.
+
+**Numbered parts as one series (`VolumeSeries`).** Doujinshi series ("Imouto wa Mesu Orc", "… 2" … "… 8") are separate
+entries on gallery sites, Hentai2Read and Manga Ball ("[H]" titles). `VolumeGroupingAdapter` wraps those providers and
+folds entries whose titles (any alias, gallery tags removed) share a base and end in a part number 1–99 into one entry
+`vol~<base words>`; part n's chapter becomes chapter n (several chapters: n.1, n.2…), keeping the part's own ids so
+reading goes straight to the provider. Refreshing the chapter list searches the base title again, which picks up new
+parts. Part series on different sites with a shared base title join one search result and are linked when it is opened.
+
+**Empty searches.** A first search page with no results asks every enabled provider that has not answered (busy,
+cooling down or cut off by the 6 s deadline) with a 15 s deadline before reporting nothing, and an empty page is not
+cached. Bulk migration searches while the library updates; "no results" there made the host skip titles a manual search
+then found.
+
 **Per-chapter quality.** Cheap ranking first (preference, language, official, provider health,
 confidence). With optimisation on, the top 2–3 candidates' page lists are fetched in parallel and 1–2
 images per candidate are probed with a 48 KB Range request for dimensions and file size. Completeness

@@ -118,13 +118,16 @@ class IdentityResolver(
         var support = 0.0
         var penalty = 0.0
         val reasons = mutableListOf<String>()
-        val ra = reference.authors + reference.artists
-        val ca = candidate.authors
+        val ra = realAuthors(reference.authors + reference.artists)
+        val ca = realAuthors(candidate.authors)
         if (ra.isNotEmpty() && ca.isNotEmpty()) {
             if (authorsOverlap(ra, ca)) {
                 support += 1.0
                 reasons += "author in common"
-            } else if ((ra + ca).all(::latinOnly) && !sharesNameWord(ra, ca)) {
+            } else if ((ra + ca).all(::latinOnly) && !sharesNameWord(ra, ca) && !authorsAlike(ra, ca) &&
+                // Korean and Chinese names have no single romanisation: differing credits prove nothing there.
+                listOf(reference.kind, candidate.kind).none { it == ContentKind.MANHWA || it == ContentKind.MANHUA }
+            ) {
                 penalty += 0.3
                 reasons += "different authors (${ra.take(2).joinToString()} vs ${ca.take(2).joinToString()})"
             }
@@ -198,6 +201,27 @@ class IdentityResolver(
         fun authorsOverlap(a: Collection<String>, b: Collection<String>): Boolean {
             val ka = a.flatMap { splitNames(it) }.flatMap { listOf(nameKey(it), TitleNormalizer.compact(it)) }.filter { it.length >= 2 }.toSet()
             return b.flatMap { splitNames(it) }.any { n -> nameKey(n) in ka || TitleNormalizer.compact(n) in ka }
+        }
+
+        /** Placeholder credits some sites show instead of a name (MangaRead's uploader "Bot", "Updating", "N/A"). */
+        private val PLACEHOLDER_AUTHORS = setOf("bot", "admin", "updating", "unknown", "na", "none", "tba", "tbd", "anonymous", "various", "author", "artist")
+
+        fun realAuthors(names: Collection<String>): List<String> = names.filter { n ->
+            val c = TitleNormalizer.compact(n)
+            c.isNotEmpty() && c !in PLACEHOLDER_AUTHORS
+        }
+
+        /**
+         * Two romanisations of one name: "Mak Ellaha" ~ "Markellaha", "Kirin Green" ~ "Kiringreen". Sites spell Korean and
+         * Chinese names differently, so a near-identical spelling is not evidence of a different author (it is not
+         * counted as an author in common either).
+         */
+        fun authorsAlike(a: Collection<String>, b: Collection<String>): Boolean {
+            val ka = a.flatMap { splitNames(it) }.map { TitleNormalizer.compact(it) }.filter { it.length >= 5 }.toSet()
+            val kb = b.flatMap { splitNames(it) }.map { TitleNormalizer.compact(it) }.filter { it.length >= 5 }.toSet()
+            return ka.any { x ->
+                kb.any { y -> x.contains(y) || y.contains(x) || 1.0 - TitleNormalizer.levenshtein(x, y).toDouble() / maxOf(x.length, y.length) >= 0.8 }
+            }
         }
 
         /** "Chugong (추공)" also counts as "Chugong" and "추공"; lists split on the usual separators. */

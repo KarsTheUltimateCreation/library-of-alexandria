@@ -464,8 +464,12 @@ class ProviderOnlyTest {
         assertEquals(0, b.chapterCalls.get(), "a library update uses beta's stored list instead of queueing")
         assertEquals(12, bg.chapters!!.size)
         b.searches.set(0)
-        agg.search("something else", s)
+        val found = agg.search("Example Series", s)
+        assertTrue(found.isNotEmpty())
         assertEquals(0, b.searches.get(), "search routes around the busy provider on page 1")
+        // A search that finds nothing elsewhere still asks it: "no results" would make a migration skip the title.
+        agg.search("something else", s)
+        assertEquals(1, b.searches.get(), "an empty first page asks the busy provider before giving up")
         // Explicit refreshes still ask it (the user is waiting for exactly that).
         agg.update(key, first.state, fetchDetails = true, fetchChapters = true, settings = s)
         assertEquals(1, b.chapterCalls.get())

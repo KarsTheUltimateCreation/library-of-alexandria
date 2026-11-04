@@ -80,6 +80,12 @@ interface SourceAdapter {
     suspend fun covers(series: SourceSeries): List<CoverCandidate> =
         listOfNotNull(series.coverUrl?.let { CoverCandidate(it, id, CoverOrigin.PROVIDER_THUMBNAIL.name, headers = imageHeaders(it)) })
 
+    /**
+     * Typical pixel area of this provider's [SourceSeries.coverUrl] (measured Nov 2026), used to choose a search
+     * result's cover among several providers before anything was measured. Default: a common 400x600 cover.
+     */
+    fun coverPixels(coverUrl: String): Long = 400L * 600
+
     /** Headers needed to load this provider's images (Referer, etc.). */
     fun imageHeaders(imageUrl: String): Map<String, String> = emptyMap()
 

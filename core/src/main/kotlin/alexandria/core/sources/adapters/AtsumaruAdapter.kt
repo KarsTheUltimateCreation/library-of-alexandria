@@ -184,6 +184,9 @@ class AtsumaruAdapter(
 
     override fun imageHeaders(imageUrl: String): Map<String, String> = mapOf("Referer" to "$baseUrl/")
 
+    /** Posters are about 460x667. */
+    override fun coverPixels(coverUrl: String) = 460L * 667
+
     override fun seriesWebUrl(seriesId: String) = "$baseUrl/manga/$seriesId"
 
     /** "/static/pages/x/0.webp", "posters/x.jpg" or an absolute URL -> CDN URL. */

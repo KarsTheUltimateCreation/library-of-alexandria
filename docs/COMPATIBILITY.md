@@ -1,19 +1,41 @@
 # Compatibility and validation status
 
-Last updated for version **1.6.8** (November 4, 2026). This page separates what was actually tested from what is
+Last updated for version **1.6.9** (November 4, 2026). This page separates what was actually tested from what is
 only expected to work. Nothing here is claimed as tested unless it was run.
 
 ## Validation performed
 
 | Level | What | Result |
 |---|---|---|
-| Unit tests (offline) | 198 tests (plus 6 opt-in live tests and the opt-in request benchmark). 1.6.8 adds: MangaFire request signatures checked against vectors from an independent implementation the live API accepted; parsing of MangaFire, MangaTaro (incl. its hourly chapter token), Flame Comics and Manga Ball (only the directly readable mirror's English chapters); MangaFire's page-1-only refreshes with a daily full read; the per-series cap (5 linked, rest as spares), spare promotion on a failing source without any search, trimming older over-linked series only of sources with no chapter of their own; outage retention keeps only chapters whose releases all belong to the unavailable sources (stale rows from older numbering are let go); cover selection measuring every candidate in parallel under one budget, slow probes as *unknown*, remembered sizes needing no request; author names with a native form in parentheses. All 1.6.7 tests (provider-only operation with zero metadata requests, corroborated identity, persistence, request budgets, cooldowns, cancellation) still pass | **Pass** |
+| Unit tests (offline) | 210 tests (plus opt-in live tests, the request benchmark and the migration replay). 1.6.9 adds: numbered parts folded into one series (real titles from Manga Ball, Hitomi and nhentai; ids stable across restarts, parts found again from the id alone, a part's chapters keep its own ids); grouping through alternative titles; romanised, placeholder ("Bot") and manhwa author credits not splitting a series; a site's second same-titled entry hidden; an edition entry not displacing a site's plain entry; Manga Ball covers on hosts that refuse a Referer; an empty first search page asking the remaining (busy) providers. 1.6.8 added: MangaFire request signatures checked against vectors from an independent implementation the live API accepted; parsing of MangaFire, MangaTaro (incl. its hourly chapter token), Flame Comics and Manga Ball (only the directly readable mirror's English chapters); MangaFire's page-1-only refreshes with a daily full read; the per-series cap (5 linked, rest as spares), spare promotion on a failing source without any search, trimming older over-linked series only of sources with no chapter of their own; outage retention keeps only chapters whose releases all belong to the unavailable sources (stale rows from older numbering are let go); cover selection measuring every candidate in parallel under one budget, slow probes as *unknown*, remembered sizes needing no request; author names with a native form in parentheses. All 1.6.7 tests (provider-only operation with zero metadata requests, corroborated identity, persistence, request budgets, cooldowns, cancellation) still pass | **Pass** |
+| Migration replay (JVM) | `MigrationReplay`: 106 titles sampled from a real Tachimanga library (Atsumaru, Asura Scans, Manga Ball, Comix, ManhwaRead, Hiperdex, XOXO Comics, Kagane, Omega Scans), searched 4 at a time with each match opened while the next searches run, as a bulk migration does; **1.6.8 and 1.6.9** against the live sites | See [the comparison](#migration-replay-168-vs-169) |
 | Live tests (JVM) | 6 opt-in tests against the real sites, incl. the four new providers: search → details → chapters → pages → image download, cover download | **Pass** (Nov 4 2026) |
 | Live request benchmark (JVM) | `RateLimitBenchmark`: the same scripted session — 14 searches, opening each first result, four library updates of those 14 series 0 h / +8 h / +16 h / +24 h apart (simulated clock, 4 at a time), the same searches again an hour later, 2 searches during a library update, reading 2 chapters of 4 series (3 images each) — run against **1.6.6** and **1.6.7** with fresh state; every HTTP request counted per host | See [the comparison](#rate-limit-comparison-166-vs-167) |
 | Build validation | APK (versionCode 106007, lib 1.6) and JVM JAR assemble. JAR inspected: only `alexandria.*` and the extension package (no kotlin/kotlinx/OkHttp/Okio/Jsoup/extensions-lib/Injekt classes); Java 17 bytecode (AGP's generated `R` classes: Java 8); no new runtime dependency | **Pass** (local build is unsigned; the published APK/JAR are signed by the release workflow) |
 | Emulator (Mihon) | Mihon v0.21.3 on an Android 15 arm64 emulator — performed for **1.6.1** only | **Not repeated for 1.6.7** |
 | Physical device | — | **Not tested** |
 | Tachimanga (iOS) | — | **Not tested** (no iOS device/simulator runtime available; Tachimanga is closed source). Nothing on this page about Tachimanga is confirmed behaviour |
+
+## Migration replay (1.6.8 vs 1.6.9)
+
+Live run on Nov 4 2026, same machine and network, same 106 titles, fresh state, default settings. "Match" = a result
+whose title is at least 0.6 similar to the library title (what a host's migration compares); "duplicate cards" =
+further results at least 0.9 similar to the searched title.
+
+| | 1.6.8 | 1.6.9 |
+|---|---:|---:|
+| Titles with a match | 104 | **105** |
+| Titles with no results at all | 1 | 1 |
+| Titles showing duplicate cards / extra cards | 28 / 45 | **16 / 20** |
+| Match covers under 300 px wide | 37 | **9** |
+| Median match cover size | 240,000 px | **741,600 px** |
+| Match covers that failed to load | 7 | **4** |
+| Median search time | 6.7 s | 6.8 s |
+
+The one title without results ("Crossed Plus One Hundred: Mimic", XOXO Comics) is carried by no bundled provider. The
+"not found in migration, found by a manual search" behaviour reported from Tachimanga did not occur in either run, so
+the empty-page fix (remaining providers asked, empty pages not cached) is **not confirmed in the app** yet. Remaining
+duplicates are mostly a gallery copy next to a series (kept apart by design) or a site listing two different entries.
 
 ## Rate-limit comparison (1.6.6 vs 1.6.7 vs 1.6.8)
 
