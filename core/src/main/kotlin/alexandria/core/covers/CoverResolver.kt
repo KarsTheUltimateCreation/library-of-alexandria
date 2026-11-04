@@ -26,7 +26,13 @@ data class ScoredCover(val candidate: CoverCandidate, val score: Double, val ver
  */
 class CoverResolver(
     private val probe: suspend (CoverCandidate) -> ImageInfo?,
-    private val maxProbes: Int = 2,
+    /** Candidates measured per resolution; all at once, so the wall time is that of the slowest within [budgetMs]. */
+    private val maxProbes: Int = 6,
+    /** Whole-batch budget: probes still running then are treated as *unknown*, not as failed. */
+    private val budgetMs: Long = 2_500,
+    /** Sizes measured earlier (no request needed); [remember] stores new measurements. */
+    private val known: (String) -> ImageInfo? = { null },
+    private val remember: (String, ImageInfo) -> Unit = { _, _ -> },
 ) {
 
     suspend fun rank(candidates: List<CoverCandidate>, settings: AggregatorSettings, originalLanguage: String?, primarySourceId: String?): List<ScoredCover> {
@@ -39,19 +45,24 @@ class CoverResolver(
             return (primary + (unique - primary.toSet())).map { ScoredCover(it, 0.0, false, listOf("high-quality covers disabled")) }
         }
 
-        // Enrich a few unknown-dimension candidates, trusted ones first.
-        val toProbe = unique.filter { it.width == null || it.height == null }
+        // Measure every candidate without known dimensions (sizes remembered from earlier need no request), all at
+        // once under one budget. A probe that fails means unreachable; one still running when the budget ends is unknown.
+        val remembered = unique.filter { it.width == null || it.height == null }.mapNotNull { c -> known(c.url)?.let { c.url to it } }.toMap()
+        val toProbe = unique.filter { (it.width == null || it.height == null) && it.url !in remembered }
             .sortedByDescending { it.coverOrigin.trust }
             .take(maxProbes)
-        val probed: Map<String, ImageInfo?> = coroutineScope {
-            toProbe.map { c ->
-                async {
-                    c.url to withTimeoutOrNull(5_000) {
-                        try { probe(c) } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { null }
+        val results = java.util.concurrent.ConcurrentHashMap<String, Result<ImageInfo?>>()
+        withTimeoutOrNull(budgetMs) {
+            coroutineScope {
+                toProbe.map { c ->
+                    async {
+                        results[c.url] = try { Result.success(probe(c)) } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (e: Exception) { Result.failure(e) }
                     }
-                }
-            }.awaitAll().toMap()
+                }.awaitAll()
+            }
         }
+        results.forEach { (url, r) -> r.getOrNull()?.let { remember(url, it) } }
+        val probed: Map<String, ImageInfo?> = remembered + results.mapValues { it.value.getOrNull() }
 
         val scored = unique.map { c ->
             val info = probed[c.url]

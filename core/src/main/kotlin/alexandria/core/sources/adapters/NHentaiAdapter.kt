@@ -30,7 +30,8 @@ class NHentaiAdapter(private val ctx: AdapterContext, override val baseUrl: Stri
     override val adult = true
     override val role = ProviderRole.GALLERY
     override val imageHosts = setOf("nhentai.net")
-    private val searchLimiter = RateLimiter.shared("nhentai-search", 3, 18_000) // 10/min
+    // Anonymous search is limited to 10/min; 6/min leaves headroom (a 30-search stress session hit 429 at 10/min).
+    private val searchLimiter = RateLimiter.shared("nhentai-search", 2, 20_000)
     private val limiter = RateLimiter.shared("nhentai", 2, 1_000)
 
     @Serializable

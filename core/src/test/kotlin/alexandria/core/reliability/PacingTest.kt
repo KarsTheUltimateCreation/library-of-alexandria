@@ -157,4 +157,51 @@ class PacingTest {
             assertTrue(ms < 2_000, "cancelled read returned after ${ms}ms")
         }
     }
+
+    @Test
+    fun `a 429 halves the service's request rate once per burst and the rate recovers`() {
+        var now = 0L
+        val l = RateLimiter(10, 1_000, key = "adaptive-test", clock = { now })
+        l.slowDown()
+        l.slowDown() // the same burst: one signal
+        assertEquals(0.5, l.factor)
+        now += 3_000
+        l.slowDown()
+        assertEquals(0.25, l.factor)
+        repeat(10) { now += 3_000; l.slowDown() }
+        assertEquals(RateLimiter.MIN_FACTOR, l.factor, "never below the floor")
+        // Quiet for long enough: each acquire after a recovery period raises the rate by half again.
+        runBlocking {
+            repeat(12) { now += RateLimiter.RECOVERY_MS + 1; l.acquire(0) }
+        }
+        assertEquals(1.0, l.factor)
+    }
+
+    @Test
+    fun `a site stricter than our rate gets far fewer 429s once the rate adapts`() = runBlocking {
+        MockWebServer().use { server ->
+            // Server accepts 3 requests per second; we are configured for 20.
+            val hits = java.util.concurrent.ConcurrentLinkedQueue<Long>()
+            var r429 = 0
+            server.dispatcher = object : mockwebserver3.Dispatcher() {
+                override fun dispatch(request: mockwebserver3.RecordedRequest): MockResponse = synchronized(hits) {
+                    val t = System.currentTimeMillis()
+                    hits.removeIf { t - it > 1_000 }
+                    if (hits.size >= 3) { r429++; MockResponse.Builder().code(429).addHeader("Retry-After", "1").build() }
+                    else { hits += t; MockResponse.Builder().code(200).body("ok").build() }
+                }
+            }
+            server.start()
+            val limiter = RateLimiter(20, 1_000, key = "strict-adaptive-${System.nanoTime()}")
+            val client = OkHttpClient()
+            var ok = 0
+            withContext(Dispatchers.IO) {
+                repeat(60) {
+                    runCatching { client.fetchText(Request.Builder().url(server.url("/")).build(), retries = 2, limiter = limiter) }.onSuccess { ok++ }
+                }
+            }
+            assertTrue(limiter.factor < 0.5, "slowed down: ${limiter.factor}")
+            assertTrue(r429 < 15, "429s stay rare after adapting: $r429 of ${server.requestCount} (ok $ok)")
+        }
+    }
 }

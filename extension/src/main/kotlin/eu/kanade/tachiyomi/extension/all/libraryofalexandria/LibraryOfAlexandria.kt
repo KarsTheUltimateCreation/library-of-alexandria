@@ -7,6 +7,7 @@ import alexandria.core.SeriesCard
 import alexandria.core.SeriesKey
 import alexandria.core.SeriesState
 import alexandria.core.cache.CacheManager
+import alexandria.core.cache.ChapterRetention
 import alexandria.core.cache.ReleaseMemo
 import alexandria.core.config.AggregatorSettings
 import alexandria.core.fallback.FallbackInterceptor
@@ -102,7 +103,7 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
 
     private val aggregator: Aggregator by lazy {
         // Confirmed provider links get their own budget so cover and metadata churn never evicts them.
-        val cache = CacheManager(store, maxPersistedEntries = 250, groupLimits = mapOf("state:" to 400, "idx:" to 2000, "rej:" to 300))
+        val cache = CacheManager(store, maxPersistedEntries = 250, groupLimits = mapOf("state:" to 400, "idx:" to 2000, "rej:" to 300, "cimg:" to 600, "cover:best:" to 400))
         val lists = CacheManager(listStore, maxPersistedEntries = MAX_STORED_LISTS, maxPersistedChars = MAX_STORED_LIST_CHARS)
         val health = ProviderHealth(store)
         val ctx = AdapterContext(client, json, userAgent)
@@ -205,7 +206,9 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
             // because of the outage. Keep the ones the host already has instead of letting it delete them.
             update.unavailableSources.isNotEmpty() -> {
                 val urls = fresh.map { it.url }.toSet()
-                val kept = chapters.filter { it.url !in urls }
+                // Only chapters that came solely from the unavailable sources (per their release memo); stale rows from
+                // older numbering or from sources that answered are let go.
+                val kept = ChapterRetention.keep(chapters, urls, update.unavailableSources, { it.url }, ::decodeReleases)
                 if (kept.isNotEmpty()) log("${key.value}: keeping ${kept.size} chapter(s) while ${update.unavailableSources.joinToString()} is unavailable")
                 (fresh + kept).sortedByDescending { it.chapter_number }
             }
@@ -325,7 +328,8 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
     private fun writeMemo(manga: SManga, state: SeriesState) {
         runCatching {
             // Only links travel in the memo; metadata is re-fetchable and would bloat the host database.
-            val slim = state.copy(metadata = null, bindings = state.bindings.mapValues { (_, b) -> b.copy(series = b.series.copy(description = null, altTitles = b.series.altTitles.take(5), genres = emptyList())) })
+            fun slim(b: alexandria.core.Binding) = b.copy(series = b.series.copy(description = null, altTitles = b.series.altTitles.take(5), genres = emptyList()))
+            val slim = state.copy(metadata = null, bindings = state.bindings.mapValues { slim(it.value) }, spares = state.spares.mapValues { slim(it.value) })
             manga.memo = JsonObject(manga.memo + (MEMO_STATE to json.encodeToJsonElement(SeriesState.serializer(), slim)))
         }
     }

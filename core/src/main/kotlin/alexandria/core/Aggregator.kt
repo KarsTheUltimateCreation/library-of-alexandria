@@ -87,6 +87,11 @@ data class SeriesState(
     val rejected: Map<String, String> = emptyMap(),
     /** Last background search of every remaining provider (progressive discovery), to keep library updates cheap. */
     val wideAt: Long = 0,
+    /**
+     * Confirmed matches beyond the per-series cap (sourceId -> provider series). Not read from, but promoted without a
+     * new search when a linked source fails or chapters are missing.
+     */
+    val spares: Map<String, Binding> = emptyMap(),
 )
 
 /** One search/browse result. [hit] is the provider entry it was built from (for local filtering), when there is one. */
@@ -157,7 +162,28 @@ class Aggregator(
     val ranker = SourceRanker(registry.health)
     private val analyzer = ChapterQualityAnalyzer(ranker, registry.health)
     val reader = ReaderResolver(registry, ranker, analyzer, cache, probeClient, log)
-    private val covers = CoverResolver(probe = { c -> ImageProbe.probe(probeClient, c.url, c.headers.toHeaders()) })
+    private val covers = CoverResolver(
+        probe = { c -> ImageProbe.probe(probeClient, c.url, c.headers.toHeaders()) },
+        known = ::knownImage,
+        remember = ::rememberImage,
+    )
+
+    /** Measured cover sizes (width × height × bytes), kept 30 days so a cover is measured once, not on every opening. */
+    private fun imageKey(url: String) = "cimg:" + Integer.toHexString(url.hashCode()) + ":" + url.length
+
+    private fun knownImage(url: String): alexandria.core.quality.ImageInfo? =
+        cache.get(imageKey(url), String.serializer(), 30 * CacheManager.DAY)?.split('x')?.takeIf { it.size >= 2 }?.let { p ->
+            val w = p[0].toIntOrNull() ?: return null
+            val h = p[1].toIntOrNull() ?: return null
+            alexandria.core.quality.ImageInfo(w, h, "", p.getOrNull(2)?.toLongOrNull())
+        }
+
+    private fun rememberImage(url: String, info: alexandria.core.quality.ImageInfo) {
+        if (info.width > 0 && info.height > 0) cache.put(imageKey(url), String.serializer(), "${info.width}x${info.height}x${info.bytes ?: ""}")
+    }
+
+    /** Pixel count of a cover measured earlier, or 0 when unknown (never makes a request). */
+    private fun knownPixels(url: String?): Long = url?.let { knownImage(it)?.pixels } ?: 0L
 
     /** Canonical chapters per series kept in memory for page resolution (bounded: long sessions browse many series). */
     private val canonical = BoundedCache<String, Map<String, CanonicalChapter>>(CANONICAL_SERIES)
@@ -281,8 +307,10 @@ class Aggregator(
             if (c.key == null) {
                 rememberHints(key, null, c.members.associate { it.sourceId to Binding(it, if (it == anchor) 1.0 else 0.8, "search title", hint = it != anchor) })
             }
-            val byPreference = c.members.sortedBy { settings.sourceRank(it.sourceId) }
-            val cover = byPreference.filter { registry[it.sourceId]?.standaloneResults != false }.firstNotNullOfOrNull { it.coverUrl }
+            // The sharpest cover measured earlier (no request), else the preferred source's.
+            val byPreference = c.members.sortedWith(compareByDescending<SourceSeries> { knownPixels(it.coverUrl) }.thenBy { settings.sourceRank(it.sourceId) })
+            val cover = c.key?.let { bestKnownCover(it) }?.takeIf { settings.externalMetadata || METADATA_PROVIDERS.none { m -> m in it } }
+                ?: byPreference.filter { registry[it.sourceId]?.standaloneResults != false }.firstNotNullOfOrNull { it.coverUrl }
             val title = c.key?.let { storedTitle(it) } ?: anchor.title
             Ranked(SeriesCard(key, title, cover, anchor), SearchRelevance.score(query, c.members.flatMap { it.allTitles() }), i)
         }
@@ -431,6 +459,39 @@ class Aggregator(
         // 5. Progressive discovery: search the remaining providers only when the linked ones leave chapters missing,
         //    fail, or are too few to fall back on. Only for host-requested updates: an internal rebuild (resolving the
         //    pages of a chapter being opened) must not wait for searches. Library updates do it at most twice a day.
+        // 5a. Over the cap (links made before it existed, or manual ones): let go of sources that add no chapter of
+        //     their own. Sources that are the only ones with some chapter always stay: the cap never costs chapters.
+        if (built != null && !gallery) {
+            pruneRedundant(key, state, built)?.let { pruned ->
+                state = pruned
+                saveState(state)
+            }
+        }
+
+        // 5b. A linked source failed or chapters are missing: promote a spare match before searching anything.
+        val enabledIds = registry.enabled(settings).map { it.id }.toSet()
+        val spares = state.spares.filterKeys { it in enabledIds && !registry.health.isCircuitOpen(it) && it !in manualUnlinks(key.value, settings) }
+        val linkedNow = state.bindings.count { (sid, b) -> !b.unverified && sid in enabledIds }
+        if (intent == Refresh.EXPLICIT && built != null && reference != null && !gallery && spares.isNotEmpty() &&
+            (built.unavailable.isNotEmpty() || needsMoreCoverage(state, built, reference, settings))
+        ) {
+            // At the cap, a failing source makes room: it swaps places with the spare (never the entry source or a manual link).
+            val anchorSid = (key as? SeriesKey.Provider)?.sourceId
+            val demotable = built.unavailable.filter { sid -> sid != anchorSid && state.bindings[sid]?.manual != true }
+            val slots = (MAX_LINKED - linkedNow).coerceAtLeast(0) + demotable.size
+            val promote = spares.entries.sortedByDescending { it.value.confidence }.take(slots)
+            val demote = demotable.take((promote.size - (MAX_LINKED - linkedNow).coerceAtLeast(0)).coerceAtLeast(0)).toSet()
+            if (promote.isNotEmpty()) {
+                state = state.copy(
+                    bindings = state.bindings - demote + promote.associate { it.key to it.value },
+                    spares = state.spares - promote.map { it.key }.toSet() + demote.associateWith { state.bindings.getValue(it) },
+                )
+                saveState(state)
+                log("coverage for ${key.value}: promoted spare ${promote.joinToString { it.key }}")
+                built = buildChapters(key, state, settings, Refresh.ROUTINE, background)
+            }
+        }
+
         val canWiden = !background || clock() - state.wideAt > BACKGROUND_WIDEN_MS
         if (intent == Refresh.EXPLICIT && built != null && reference != null && !gallery && !settings.deepDiscovery && canWiden &&
             needsMoreCoverage(state, built, reference, settings)
@@ -451,6 +512,28 @@ class Aggregator(
         built?.let { canonical[key.value] = it.canonical.associateBy { c -> c.key } }
         val details = buildDetails(key, state, cover, built?.report, settings, titleHint)
         return SeriesUpdate(details, built?.entries, state, built?.report, built?.unavailable.orEmpty())
+    }
+
+    /**
+     * Bindings to drop so the series has at most [MAX_LINKED] linked sources: never the entry source or manual links,
+     * never a source that is the only one listing some chapter; among the rest, the ones covering fewest chapters go
+     * first. Dropped matches become spares. Null when nothing changes.
+     */
+    private fun pruneRedundant(key: SeriesKey, state: SeriesState, built: Built): SeriesState? {
+        val anchor = (key as? SeriesKey.Provider)?.sourceId
+        val active = state.bindings.filterValues { !it.unverified }
+        if (active.size <= MAX_LINKED) return null
+        val coverage = built.canonical.flatMap { it.sources.distinct() }.groupingBy { it }.eachCount()
+        val unique = built.canonical.filter { it.sources.distinct().size == 1 }.map { it.sources.first() }.toSet()
+        val droppable = active.filter { (sid, b) -> sid != anchor && !b.manual && sid !in unique && sid !in built.unavailable }
+            .keys.sortedBy { coverage[it] ?: 0 }
+        val drop = droppable.take(active.size - MAX_LINKED).toSet()
+        if (drop.isEmpty()) return null
+        log("${key.value}: ${drop.joinToString()} add no chapters of their own; kept as spares (cap $MAX_LINKED)")
+        return state.copy(
+            bindings = state.bindings - drop,
+            spares = (state.spares + drop.associateWith { state.bindings.getValue(it) }).entries.take(MAX_SPARES).associate { it.key to it.value },
+        )
     }
 
     /** Links read back from the host's chapter records: confirmed earlier, so they are trusted without a search. */
@@ -512,7 +595,7 @@ class Aggregator(
         val adultSeries = meta.looksAdult || state.bindings.keys.any { registry[it]?.adult == true }
         val unlinked = manualUnlinks(state.key, settings)
         return registry.forLinking(settings, adultSeries).filter { a ->
-            a.id !in state.bindings && a.id !in unlinked && (state.misses[a.id]?.let { now - it > MISS_TTL } ?: true)
+            a.id !in state.bindings && a.id !in state.spares && a.id !in unlinked && (state.misses[a.id]?.let { now - it > MISS_TTL } ?: true)
         }
     }
 
@@ -751,8 +834,12 @@ class Aggregator(
         // Re-search providers that had no match weekly, not on every library refresh.
         val candidates = discoverable(state, meta, settings)
         val linked = state.bindings.count { (sid, b) -> !b.unverified && registry[sid] != null && (settings.enabledSources.isEmpty() || sid in settings.enabledSources) }
+        val free = MAX_LINKED - linked
         var toFind = when {
-            deep -> candidates
+            free <= 0 -> emptyList() // the cap: enough sources to read from and fall back on
+            // "Search every source" asks everyone; a wider search for missing chapters asks the most promising few.
+            deep && settings.deepDiscovery -> candidates
+            deep -> discoveryOrder(candidates, meta, settings).take((free * 2).coerceAtLeast(INITIAL_DISCOVERY))
             linked >= TARGET_LINKED -> emptyList()
             else -> discoveryOrder(candidates, meta, settings).take(INITIAL_DISCOVERY)
         }
@@ -790,7 +877,16 @@ class Aggregator(
             crossConfirmed(ref, toFind, results, settings).forEach { (sid, b) -> found[sid] = b; missed.remove(sid) }
         }
         recordDiscovery(toFind.filter { results.containsKey(it.id) }.map { it.id }, found.keys)
-        return state.copy(bindings = state.bindings + found, misses = state.misses + missed)
+        // More matches than free slots: the best (confidence, then discovery order) are linked, the rest kept as spares.
+        val order = discoveryOrder(toFind, meta, settings).map { it.id }
+        val ranked = found.entries.sortedWith(compareByDescending<Map.Entry<String, Binding>> { it.value.confidence }.thenBy { order.indexOf(it.key) })
+        val link = ranked.take(free.coerceAtLeast(0)).associate { it.key to it.value }
+        val spare = ranked.drop(free.coerceAtLeast(0)).associate { it.key to it.value }
+        return state.copy(
+            bindings = state.bindings + link,
+            misses = state.misses + missed,
+            spares = (state.spares - link.keys + spare).entries.take(MAX_SPARES).associate { it.key to it.value },
+        )
     }
 
     private suspend fun crossConfirmed(
@@ -960,12 +1056,17 @@ class Aggregator(
         val ranked = covers.rank(candidates, settings, meta?.originalLanguage ?: merged(state)?.metadata?.originalLanguage, primaryBinding(state, settings))
         if (settings.cacheCovers && ranked.isNotEmpty()) {
             cache.put(cacheKey, ListSerializer(CoverCandidate.serializer()), ranked.take(4).map { it.candidate })
+            cache.put("cover:best:${key.value}", String.serializer(), ranked.first().candidate.url)
         }
         return ranked
     }
 
     private fun primaryBinding(state: SeriesState, settings: AggregatorSettings): String? =
         state.bindings.filterValues { !it.unverified }.keys.sortedBy { settings.sourceRank(it) }.firstOrNull()
+
+    /** The cover chosen when the series was last opened (cached ranking), without any request. */
+    private fun bestKnownCover(key: String): String? =
+        cache.get("cover:best:$key", String.serializer(), 30 * CacheManager.DAY)
 
     /** Browse-grid thumbnail: small pre-resized art; the full-quality cover is chosen when the series is opened. */
     private fun quickCover(m: SeriesMetadata, hits0: List<SourceSeries>, settings: AggregatorSettings): String? {
@@ -1164,6 +1265,10 @@ class Aggregator(
 
         /** A library update searches every remaining provider for a series at most this often. */
         const val BACKGROUND_WIDEN_MS = 12 * CacheManager.HOUR
+
+        /** Most sources linked (read from and refreshed) per series; further confirmed matches are kept as spares. */
+        const val MAX_LINKED = 5
+        const val MAX_SPARES = 6
 
         /** Linked providers wanted per series: one to read from, one to fall back on. */
         const val TARGET_LINKED = 2

@@ -5,6 +5,10 @@ import alexandria.core.ranking.ProviderHealth
 import alexandria.core.sources.adapters.AsuraScansAdapter
 import alexandria.core.sources.adapters.AtsumaruAdapter
 import alexandria.core.sources.adapters.MangaTownAdapter
+import alexandria.core.sources.adapters.MangaFireAdapter
+import alexandria.core.sources.adapters.MangaTaroAdapter
+import alexandria.core.sources.adapters.MangaBallAdapter
+import alexandria.core.sources.adapters.FlameComicsAdapter
 import alexandria.core.sources.adapters.EHentaiAdapter
 import alexandria.core.sources.adapters.Hentai20Adapter
 import alexandria.core.sources.adapters.Hentai2ReadAdapter
@@ -87,6 +91,8 @@ class SourceRegistry(private val adapters: List<SourceAdapter>, val health: Prov
                 MgekoAdapter(ctx), AtsumaruAdapter(ctx),
                 // Added in 1.6.6 (ids namespaced "loa_"); progressive discovery asks them when the others fall short.
                 AsuraScansAdapter(ctx), MangaTownAdapter(ctx),
+                // Added in 1.6.8.
+                MangaFireAdapter(ctx), MangaTaroAdapter(ctx), FlameComicsAdapter(ctx), MangaBallAdapter(ctx),
                 // Adult series providers: searched to link a catalogue series only when it is adult content.
                 HiperdexAdapter(ctx), OmegaScansAdapter(ctx), ManhwaReadAdapter(ctx), Hentai20Adapter(ctx), Hentai2ReadAdapter(ctx),
                 // Gallery sites (one-shots, doujinshi): standalone search results only.

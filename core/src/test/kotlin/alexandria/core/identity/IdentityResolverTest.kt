@@ -101,4 +101,11 @@ class IdentityResolverTest {
         val c = b.copy(ids = ExternalIds(anilist = 105398))
         assertEquals("2", resolver.pick(soloLeveling, listOf(a, c))!!.first.id)
     }
+
+    @Test
+    fun `author names with a native form in parentheses still agree`() {
+        assert(IdentityResolver.authorsOverlap(listOf("Chugong (추공)", "h-goon (현군)"), listOf("Chugong")))
+        assert(IdentityResolver.authorsOverlap(listOf("추공"), listOf("Chugong (추공)")))
+        assert(!IdentityResolver.authorsOverlap(listOf("Naoki Urasawa"), listOf("Chugong (추공)")))
+    }
 }

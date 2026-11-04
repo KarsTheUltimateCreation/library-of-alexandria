@@ -470,4 +470,73 @@ class ProviderOnlyTest {
         agg.update(key, first.state, fetchDetails = true, fetchChapters = true, settings = s)
         assertEquals(1, b.chapterCalls.get())
     }
+
+    @Test
+    fun `an outage keeps only chapters that came solely from the unavailable source`() {
+        fun r(sid: String) = alexandria.core.reconciliation.Release(sid, "s", "c", label = "", language = "en")
+        data class Row(val url: String, val releases: List<alexandria.core.reconciliation.Release>?)
+        val existing = listOf(
+            Row("p:a:x|en:c:10", listOf(r("beta"))),                  // only on the source that is down: kept
+            Row("p:a:x|en:s2:c:26", listOf(r("mangakatana"))),       // old numbering, source answered: dropped
+            Row("p:a:x|en:s1:c:25", listOf(r("atsumaru"), r("beta"))), // also on a source that answered: dropped
+            Row("p:a:x|en:c:9", null),                               // no release record: dropped
+            Row("p:a:x|en:c:1", listOf(r("beta"))),                  // still listed: not duplicated
+        )
+        val kept = alexandria.core.cache.ChapterRetention.keep(existing, setOf("p:a:x|en:c:1"), setOf("beta"), { it.url }, { it.releases })
+        assertEquals(listOf("p:a:x|en:c:10"), kept.map { it.url })
+        assertEquals(emptyList(), alexandria.core.cache.ChapterRetention.keep(existing, emptySet(), emptySet(), { it.url }, { it.releases }))
+    }
+
+    @Test
+    fun `at most five sources are linked per series, further matches are kept as spares`() = runTest {
+        val sites = (1..8).map { Site("s$it", mutableListOf(work("w$it", chapters = (1..10).toList()))) }
+        val agg = aggregator(sites)
+        val key = SeriesKey.Provider("s1", "w1")
+        val u = agg.update(key, null, true, true, s.copy(deepDiscovery = true))
+        assertEquals(5, u.state.bindings.size, "${u.state.bindings.keys}")
+        assertEquals(3, u.state.spares.size)
+        assertTrue("s1" in u.state.bindings)
+        // A library update refreshes no more than the linked five.
+        sites.forEach { it.chapterCalls.set(0) }
+        now += CacheManager.DAY
+        agg.update(key, u.state, fetchDetails = true, fetchChapters = true, settings = s)
+        assertEquals(5, sites.sumOf { it.chapterCalls.get() })
+    }
+
+    @Test
+    fun `a failing linked source is replaced by a spare without searching`() = runTest {
+        val sites = (1..7).map { Site("s$it", mutableListOf(work("w$it", chapters = (1..10).toList()))) }
+        val agg = aggregator(sites)
+        val key = SeriesKey.Provider("s1", "w1")
+        val first = agg.update(key, null, true, true, s.copy(deepDiscovery = true))
+        val linked = first.state.bindings.keys - "s1"
+        val spare = first.state.spares.keys.first()
+        sites.first { it.id == linked.first() }.failChapters = true
+        agg.clearChapterLists() // nothing cached for the failing source
+        sites.forEach { it.searches.set(0) }
+        now += CacheManager.DAY
+        val after = agg.update(key, first.state, true, true, s)
+        assertTrue(spare in after.state.bindings, "spare promoted: ${after.state.bindings.keys}")
+        assertTrue(after.state.bindings.size <= 5, "a swap, not an extra link: ${after.state.bindings.keys}")
+        assertTrue(linked.first() in after.state.spares, "the failing source became a spare")
+        assertEquals(0, sites.sumOf { it.searches.get() }, "no search was needed")
+        assertEquals(10, after.chapters!!.size)
+    }
+
+    @Test
+    fun `links beyond the cap are trimmed only when they add no chapter of their own`() = runTest {
+        // Seven links from before the cap existed; s7 alone has chapter 11.
+        val sites = (1..7).map { i -> Site("s$i", mutableListOf(work("w$i", chapters = if (i == 7) (1..11).toList() else (1..10).toList()))) }
+        val agg = aggregator(sites)
+        val key = SeriesKey.Provider("s1", "w1")
+        val legacy = SeriesState(key.value, bindings = sites.associate { st ->
+            st.id to Binding(SourceSeries(st.id, st.works[0].id, "Example Series", authors = listOf("Jane Doe"), detailed = true), 1.0, "id")
+        })
+        val u = agg.update(key, legacy, false, true, s)
+        assertEquals(5, u.state.bindings.size, "${u.state.bindings.keys}")
+        assertTrue("s7" in u.state.bindings, "the only source of chapter 11 stays")
+        assertTrue("s1" in u.state.bindings, "the entry source stays")
+        assertEquals(2, u.state.spares.size)
+        assertEquals(11, u.chapters!!.size, "no chapter lost")
+    }
 }

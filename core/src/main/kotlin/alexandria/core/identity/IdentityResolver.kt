@@ -200,7 +200,13 @@ class IdentityResolver(
             return b.flatMap { splitNames(it) }.any { n -> nameKey(n) in ka || TitleNormalizer.compact(n) in ka }
         }
 
-        private fun splitNames(s: String) = s.split(',', ';', '/', '&', '、').map { it.trim() }.filter { it.isNotEmpty() }
+        /** "Chugong (추공)" also counts as "Chugong" and "추공"; lists split on the usual separators. */
+        private fun splitNames(s: String) = s.split(',', ';', '/', '&', '、').map { it.trim() }.filter { it.isNotEmpty() }.flatMap { n ->
+            val inner = PAREN.findAll(n).map { it.groupValues[1].trim() }.toList()
+            listOf(n, PAREN.replace(n, " ").trim()) + inner
+        }.filter { it.isNotEmpty() }.distinct()
+
+        private val PAREN = Regex("""[(（]([^)）]*)[)）]""")
 
         private fun sharesNameWord(a: Collection<String>, b: Collection<String>): Boolean {
             val wa = a.flatMap { TitleNormalizer.normalize(it).split(' ') }.filter { it.length >= 3 }.toSet()

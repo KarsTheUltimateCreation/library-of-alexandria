@@ -103,7 +103,12 @@ class RateLimitBenchmark {
         val queries = listOf(
             "solo leveling", "one piece", "berserk", "omniscient reader", "chainsaw man", "the beginning after the end",
             "frieren", "blue lock", "jujutsu kaisen", "vinland saga", "tower of god", "kagurabachi", "dandadan", "nano machine",
-        )
+        ) + if (System.getenv("LOA_BENCH_SCALE") == "2") listOf(
+            "omniscient reader's viewpoint", "the greatest estate developer", "eleceed", "lookism", "sakamoto days", "spy x family",
+            "kaiju no 8", "the boxer", "return of the mount hua sect", "player who returned 10,000 years later", "my hero academia",
+            "black clover", "oshi no ko", "mashle", "witch hat atelier", "regressor's tale of cultivation",
+        ) else emptyList()
+        val parallel = if (System.getenv("LOA_BENCH_SCALE") == "2") 8 else 4
         val opened = mutableListOf<SeriesKey>()
         phase("search") {
             for (q in queries) {
@@ -124,7 +129,7 @@ class RateLimitBenchmark {
             }
         }
         suspend fun libraryUpdate(tag: String) {
-            val gate = Semaphore(4)
+            val gate = Semaphore(parallel)
             opened.map { k ->
                 async {
                     gate.withPermit {

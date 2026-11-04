@@ -7,7 +7,9 @@ Third-party work
 ----------------
 * Provider parsing for WeebCentral, MangaPill, MangaKatana, MangaRead (Madara multisrc),
   mgeko (MangaRawClub), ManhwaRead and MangaTown, and the Atsumaru, Hiperdex (Hiper multisrc),
-  Omega Scans (HeanCMS multisrc) and Asura Scans API usage (including Asura's Astro prop decoding)
+  Omega Scans (HeanCMS multisrc) and Asura Scans API usage (including Asura's Astro prop decoding),
+  MangaFire (API and request signing), MangaTaro (mangataro multisrc: API and chapter token),
+  Flame Comics (Next.js data routes) and Manga Ball (API)
   (CSS selectors, request logic, request pacing), and the
   extension JAR packaging/signing approach in buildSrc/, are adapted from
   keiyoushi/extensions-source (https://github.com/keiyoushi/extensions-source),

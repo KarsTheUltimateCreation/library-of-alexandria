@@ -187,18 +187,29 @@ private suspend fun <T> withClearance(service: String, limiter: RateLimiter?, bu
     val started = netNow()
     fun affordable(now: Long) = budget?.let { (it.remainingMs(now) - RetryPolicy.MIN_ATTEMPT_MS).coerceAtLeast(0) }
     val slots = ServiceGate.slots(service)
-    val wait: suspend () -> Unit = {
+    suspend fun coolDown() {
         val cd = ServiceGate.remainingCoolDown(service, netNow())
         if (cd > 0) {
             val max = affordable(netNow()) ?: RetryPolicy.MAX_INLINE_WAIT_MS
             if (cd > max) throw CoolingDownException(service, cd)
             delay(cd)
         }
-        if (limiter != null) {
-            val max = affordable(netNow())
-            if (!limiter.acquire(max)) throw ProviderTimeoutException(budget?.owner ?: service, max ?: 0, ProviderTimeoutException.Phase.QUEUED)
-        }
+    }
+    // Order matters: the rate-limit token is taken only once a connection slot is held, right before sending.
+    // Taking it first let tokens pile up while slow responses held every slot, then released them as a burst.
+    val wait: suspend () -> Unit = {
+        coolDown()
         slots.acquire()
+        try {
+            coolDown() // a 429 may have arrived while this request waited for its slot
+            if (limiter != null) {
+                val max = affordable(netNow())
+                if (!limiter.acquire(max)) throw ProviderTimeoutException(budget?.owner ?: service, max ?: 0, ProviderTimeoutException.Phase.QUEUED)
+            }
+        } catch (e: Throwable) {
+            slots.release()
+            throw e
+        }
     }
     if (budget != null) budget.queued { wait() } else wait()
     try {
@@ -245,6 +256,8 @@ suspend fun OkHttpClient.fetch(request: Request, retries: Int = 2, limiter: Rate
         val error = outcome.exceptionOrNull() as HttpError
         val retryAfter = error.retryAfterMillis
         val transient = error.code == 429 || error.code in 500..599
+        // The service says we are too fast: lower this service's request rate (it recovers gradually).
+        if (error.code == 429) limiter?.slowDown()
         if (transient) {
             // Shared: every caller of this service waits, not just this one.
             val pause = retryAfter ?: if (error.code == 429) RetryPolicy.DEFAULT_429_COOLDOWN_MS else null
@@ -286,10 +299,32 @@ class RateLimiter(
     private val waiters = java.util.concurrent.atomic.AtomicInteger()
 
     /**
+     * Share of the configured rate currently allowed (adaptive): halved by each 429 burst ([slowDown]), raised by
+     * half again after every [RECOVERY_MS] without one, back to the full rate. A site stricter than the configured
+     * rate therefore converges to what it accepts instead of answering 429 to a steady stream of requests.
+     */
+    @Volatile var factor = 1.0
+        private set
+    @Volatile private var slowedAt = Long.MIN_VALUE / 2
+
+    private val rate: Double get() = permits * factor // tokens per period
+    private val capacity: Double get() = maxOf(1.0, rate)
+
+    fun slowDown() {
+        val now = clock()
+        synchronized(this) {
+            // Several requests in flight answer 429 together: that is one signal, not several.
+            if (now - slowedAt < SLOWDOWN_GRACE_MS) return
+            factor = maxOf(MIN_FACTOR, factor / 2)
+            slowedAt = now
+        }
+    }
+
+    /**
      * Roughly how long a new request would wait for a token right now (callers already queued × token interval).
      * Lets optional work go elsewhere instead of joining a queue that would outlast its deadline.
      */
-    fun backlogMs(): Long = waiters.get() * periodMillis / permits
+    fun backlogMs(): Long = (waiters.get() * periodMillis / rate).toLong()
 
     suspend fun acquire() {
         acquire(null)
@@ -304,13 +339,17 @@ class RateLimiter(
         while (true) {
             val wait = mutex.withLock {
                 val now = clock()
-                tokens = minOf(permits.toDouble(), tokens + (now - last) * permits / periodMillis.toDouble())
+                if (factor < 1.0 && now - slowedAt > RECOVERY_MS) synchronized(this) {
+                    factor = minOf(1.0, factor * 1.5)
+                    slowedAt = now - SLOWDOWN_GRACE_MS // recovering is not a fresh slow-down
+                }
+                tokens = minOf(capacity, tokens + (now - last) * rate / periodMillis.toDouble())
                 last = now
                 if (tokens >= 1.0) {
                     tokens -= 1.0
                     0L
                 } else {
-                    ((1.0 - tokens) * periodMillis / permits).toLong().coerceAtLeast(10)
+                    ((1.0 - tokens) * periodMillis / rate).toLong().coerceAtLeast(10)
                 }
             }
             if (wait == 0L) return true
@@ -322,6 +361,11 @@ class RateLimiter(
     }
 
     companion object {
+        /** Lowest share of the configured rate a run of 429s can push a service to. */
+        const val MIN_FACTOR = 0.1
+        const val SLOWDOWN_GRACE_MS = 2_000L
+        const val RECOVERY_MS = 30_000L
+
         private val shared = ConcurrentHashMap<String, RateLimiter>()
 
         /** Process-wide limiter per key so every component shares one budget per service. */

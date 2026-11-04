@@ -192,6 +192,20 @@ covered by a JVM test that runs every workflow against clients that record each 
   queued, not recorded as misses) when it is spent; the every-provider widening runs at most every 12 h per series.
   Provider search results and details are shared for 20 min between search, linking and updates (single-flight).
 
+**Per-series cap (1.6.8).** At most 5 sources are linked (read from and refreshed) per series. Discovery stops at the
+cap; a wider search asks at most twice the free slots (*Search every source* asks everyone). Matches beyond the
+cap are kept as `SeriesState.spares` (≤ 6) and promoted without searching when a linked source fails or chapters are
+missing. A series linked to more sources before the cap existed drops only sources that are the only one for no
+chapter, lowest coverage first, never the entry source or manual links.
+
+**Covers (1.6.8).** All candidates without known dimensions (≤ 6) are probed at once (first 64 KB, Range request)
+under one 2.5 s budget, concurrently with the chapter list. A probe still running at the budget's end is *unknown*
+(neutral), a failed one *unreachable* (penalised). Measured sizes are kept 30 days (`cimg:`), the chosen cover per
+series 30 days (`cover:best:`), so search results show the sharpest known cover without a request.
+
+**Outage retention (1.6.8).** During a refresh with an unavailable linked source, a chapter the host has but the
+fresh list lacks is kept only if its release memo shows it came solely from unavailable sources.
+
 ## 4. Known limitations
 
 - Providers behind Cloudflare challenges or logins are not supported in the aggregation path.

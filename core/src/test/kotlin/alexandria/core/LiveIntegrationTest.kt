@@ -59,7 +59,9 @@ class LiveIntegrationTest {
         live()
         val agg = aggregator()
         // mgeko carries mostly manhwa/manhua (no One Piece).
-        val queries = mapOf("mgeko" to "Omniscient Reader's Viewpoint", "loa_asurascans" to "Overgeared", "loa_mangatown" to "Berserk")
+        val queries = mapOf("mgeko" to "Omniscient Reader's Viewpoint", "loa_asurascans" to "Overgeared", "loa_mangatown" to "Berserk", "loa_flamecomics" to "Omniscient Reader",
+            // Most of Manga Ball's library is on its Cloudflare-challenged mirror (not listed); this series has readable chapters.
+            "loa_mangaball" to "Solo Leveling")
         // Adult and gallery providers do not carry these series (and two sit behind Cloudflare challenges); they are
         // exercised through the unified-series tests instead.
         for (adapter in agg.registry.all.filter { !it.adult && it.role == alexandria.core.sources.ProviderRole.SERIES }) {
@@ -72,7 +74,8 @@ class LiveIntegrationTest {
             println("  details: alt=${detailed.altTitles.take(4)} ids=${detailed.ids} kind=${detailed.kind} status=${detailed.status}")
             val chapters = adapter.chapters(detailed, listOf("en"))
             println("  chapters: ${chapters.size}, first=${chapters.lastOrNull()?.label}, last=${chapters.firstOrNull()?.label}")
-            if (adapter.id != "mangadex") assertTrue(chapters.size > 100, "${adapter.id} chapter list too small")
+            // MangaDex and Manga Ball list only part of a series (licensing; Manga Ball's directly readable mirror).
+            if (adapter.id != "mangadex" && adapter.id != "loa_mangaball") assertTrue(chapters.size > 100, "${adapter.id} chapter list too small")
             // Some listed chapters are broken upstream (MangaDex lists chapters whose at-home lookup 404s),
             // so try a few; the aggregator itself handles this through fallback.
             val pool = if (chapters.size > 1) chapters.filter { !it.externalOnly } else {

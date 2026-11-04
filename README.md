@@ -34,7 +34,8 @@ Requires an app supporting extension lib **1.6** (Mihon 0.21+, Tachimanga 4.16+)
 | Feature | How |
 |---|---|
 | Multi-source search | The five most relevant healthy providers first (all of them when they find little, or when you scroll past the end of the results); the results page never waits more than 6 s for a provider. With external metadata enabled, MangaBaka (or AniList) is searched too |
-| Request control | Library updates refresh the two providers furthest ahead on every update and the other linked ones at most every 6 h; searches made by library updates draw on a shared per-provider budget (6/min) and widen to every provider at most twice a day per series; identical provider searches and detail lookups are shared between search, linking and updates for 20 min |
+| Sources per series | At most 5 linked sources are read from and refreshed per series; further confirmed matches are kept as *spares* and promoted without a new search when a linked source fails or chapters are missing. Older series with more links are trimmed only of sources that add no chapter of their own — the cap never costs a chapter |
+| Request control | Each service's request rate adapts: a 429 halves it, it recovers gradually once the 429s stop. Library updates refresh the two providers furthest ahead on every update and the other linked ones at most every 6 h; searches made by library updates draw on a shared per-provider budget (6/min) and widen to every provider at most twice a day per series; identical provider searches and detail lookups are shared between search, linking and updates for 20 min |
 | Speed | Per-request network timeouts adapt to each provider's measured latency and start only when a request is actually sent; a failing provider cools down (2 → 30 min); a service's `Retry-After` (seconds or HTTP date) pauses every caller of that service instead of being retried early; recent chapter lists are reused instead of refetched; identical concurrent requests are merged |
 | Source discovery | Opening a series searches the most promising healthy providers first (past hit rate, health, content-type specialty); the rest are searched only when chapters are missing, a linked source fails, or *Search every source* is on |
 | Series identification | Ids the providers publish (AniList / MAL / MangaUpdates / MangaDex links) first, then all title variants with edition guards: *"Solo Leveling Novel"*, *"(Volume Version)"*, sequels and doujinshi are never merged with the main work. **Equal titles are never enough**: a link needs an author, year, id or second title in common; different authors keep same-title works apart; uncertain copies stay separate and can be linked by hand. Confirmed links are remembered, so search keeps showing a library entry as that entry whatever the provider order |
@@ -45,15 +46,17 @@ Requires an app supporting extension lib **1.6** (Mihon 0.21+, Tachimanga 4.16+)
 | Per-chapter quality | Top candidates' page lists and a few image headers (48 KB range requests) are compared: completeness first, then resolution/compression, reliability, preference |
 | Fallback | A failing *or timing-out* provider → next release; a stalled candidate never holds up the per-chapter comparison; a failing page image — including one whose download breaks off after it started — → same page from another release with the same page count |
 | Offline resilience | Provider links and the last known chapter list of each linked provider survive app restarts (bounded); an outage keeps the chapters you already have instead of removing them |
-| Covers | Provider covers (plus MangaBaka raw art / AniList when enabled) — scored by resolution, bytes/pixel (catches upscales and over-compression), aspect, authenticity, original-language edition; fallback to the next candidate if loading fails |
+| Covers | Every linked source's cover (plus MangaBaka raw art / AniList when enabled) is measured at once — first 64 KB only, one 2.5 s budget, alongside the chapter list so it adds no wait — and sizes are remembered for 30 days; the highest resolution wins, scored by resolution, bytes/pixel (catches upscales and over-compression), aspect, authenticity, original-language edition; fallback to the next candidate if loading fails |
 | External metadata | Off by default. MangaBaka and/or AniList (catalogue details, original chapter count, catalogue filters and popular lists), cached and rate-limited, when enabled |
 
 English only, 18+ content included. Bundled providers:
 
 - **Series:** MangaDex (API, English chapters only; used for chapters, never for covers or standalone results),
   WeebCentral, MangaPill, MangaKatana, MangaRead, mgeko (mostly manhwa/manhua) and Atsumaru (API, several
-  scanlation groups per chapter); since 1.6.6 also Asura Scans (API, manhwa) and MangaTown (large manga catalogue).
-  Provider ids added from 1.6.6 on are namespaced `loa_` (`loa_asurascans`, `loa_mangatown`).
+  scanlation groups per chapter); since 1.6.6 also Asura Scans (API, manhwa) and MangaTown (large manga catalogue);
+  since 1.6.8 MangaFire (API, large catalogue, original-size covers), MangaTaro (API), Flame Comics (manhwa group) and
+  Manga Ball (API; only chapters on its mirror that loads without a Cloudflare browser check — a small part of its
+  library). Provider ids added from 1.6.6 on are namespaced `loa_`.
 - **Adult series:** Hiperdex, Omega Scans, ManhwaRead, Hentai20 and Hentai2Read — searched to link a series only
   when it is adult content. ManhwaRead and Hentai2Read sit behind Cloudflare and need the app to solve the challenge.
 - **Galleries** (doujinshi, one-shots): NHentai, Hitomi, E-Hentai and Pururin — English galleries only, shown as
@@ -109,7 +112,7 @@ Read [Architecture](docs/ARCHITECTURE.md) for the research findings and design, 
 ## Credits and licence
 
 Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
-Provider parsing for WeebCentral, MangaPill, MangaKatana, MangaRead (Madara), mgeko, Atsumaru, Hiperdex (Hiper), Omega Scans (HeanCMS), ManhwaRead, Asura Scans and MangaTown and the JAR packaging are adapted from
+Provider parsing for WeebCentral, MangaPill, MangaKatana, MangaRead (Madara), mgeko, Atsumaru, Hiperdex (Hiper), Omega Scans (HeanCMS), ManhwaRead, Asura Scans, MangaTown, MangaFire, MangaTaro, Flame Comics and Manga Ball and the JAR packaging are adapted from
 [keiyoushi/extensions-source](https://github.com/keiyoushi/extensions-source) (Apache-2.0).
 Optional metadata from [MangaBaka](https://mangabaka.org) (MangaBaka-original data CC BY-NC-SA 4.0) and
 [AniList](https://anilist.co), only when enabled. Library of Alexandria hosts no content.
