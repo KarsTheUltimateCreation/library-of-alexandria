@@ -1,0 +1,33 @@
+{
+  "name": "Library of Alexandria",
+  "badgeLabel": "LoA",
+  "signingKey": "59f45e32a80cbe0409dc8e30970f60f0583b25bb0e08a50942c7a004fdba55d6",
+  "contact": {
+    "website": "https://github.com/KarsTheUltimateCreation/library-of-alexandria"
+  },
+  "extensionList": {
+    "extensions": [
+      {
+        "name": "Library of Alexandria",
+        "packageName": "eu.kanade.tachiyomi.extension.all.libraryofalexandria",
+        "resources": {
+          "apkUrl": "https://github.com/KarsTheUltimateCreation/library-of-alexandria/releases/download/v1.6.10/tachiyomi-all.libraryofalexandria-v1.6.10.apk",
+          "iconUrl": "https://raw.githubusercontent.com/KarsTheUltimateCreation/library-of-alexandria/repo/icon/eu.kanade.tachiyomi.extension.all.libraryofalexandria.png",
+          "jarUrl": "https://github.com/KarsTheUltimateCreation/library-of-alexandria/releases/download/v1.6.10/tachiyomi-all.libraryofalexandria-v1.6.10.jar"
+        },
+        "extensionLib": "1.6",
+        "versionCode": "106010",
+        "versionName": "1.6.10",
+        "contentWarning": "CONTENT_WARNING_MIXED",
+        "sources": [
+          {
+            "id": "2373788227719535733",
+            "name": "Library of Alexandria",
+            "language": "en",
+            "homeUrl": "https://mangabaka.org"
+          }
+        ]
+      }
+    ]
+  }
+}
