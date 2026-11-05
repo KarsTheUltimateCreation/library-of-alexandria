@@ -130,6 +130,31 @@ Target: Tachimanga **4.16+** (extension lib 1.6 support per its changelog). The 
 | Preference widgets | Switch / List / MultiSelect / EditText are standard extension widgets | — |
 | `OnPreferenceChangeListener` (clear-cache action) | Unknown | The action may not run; use the app's own "clear data" instead |
 
+### Device checklist (1.6.10, Tachimanga on iPhone)
+
+Record the Tachimanga and iOS versions. Nothing below has been seen on a device yet; the JVM tests cover the logic.
+
+1. **Duplicate searches** – search "attack on titan" (and a title that was a duplicate before): one main-series card,
+   in normal case; editions, side stories and guidebooks stay separate. If the library holds one of two old copies,
+   the card shown is the library one (it shows as *in library*).
+2. **Pagination** – scroll to the end of a search: page 2 adds other works only, never a second card of a work on
+   page 1. Go back and search again: every card from both pages is still there.
+3. **Speed** – a search with an exact match shows within ~2 s; opening a series does not wait for its cover.
+4. **Migration** – *Migrate* an entry from another source to Library of Alexandria: the target is found; a rare title
+   with no exact match still finds results (wider search).
+5. **Reading** – open old library entries (both copies of a merged work, if you had both): chapters and read state
+   are intact; chapters open.
+6. **18+ off (default)** – settings: the six explicit providers are not in *Sources* / *Preferred source* (reopen
+   settings after switching). Search a gallery-only title: none of their results. Open a library entry linked to one
+   of them: its other sources still load; no cover or page is fetched from the hidden provider.
+7. **18+ on, then off again** – switch on, reopen settings: the six are listed with your earlier ticks. Switch off:
+   your ticks are kept for next time.
+8. **Cached covers** – a series whose cover came from a now-hidden provider shows another source's cover after a
+   refresh (the library thumbnail may keep the old image until then).
+9. **Fallback** – while reading, switch 18+ off and reopen the chapter: pages come from the remaining sources only.
+10. **Restart** – force-quit and relaunch: the 18+ choice, the merged search identity and numbered-part series ids
+    are unchanged.
+
 ### Device checklist (1.6.8, Tachimanga on iPhone)
 
 Record the Tachimanga version and iOS version first. "Pass" means seen on the device.

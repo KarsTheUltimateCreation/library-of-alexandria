@@ -52,11 +52,27 @@ internal object Galleries {
         return (latin ?: halves.firstOrNull())?.ifEmpty { null } ?: raw.trim()
     }
 
-    /** Every name a gallery goes by, cleaned title first. */
+    /**
+     * Every name the gallery itself goes by, cleaned title first. Bracket groups are left out: they name the circle,
+     * the event and, for parodies, the *original series* ("Yamada/Tayama (Smoking Behind the Supermarket with You)"),
+     * which is not this work's title. See [references].
+     */
     fun titles(vararg raw: String?): List<String> = raw.filterNotNull().filter { it.isNotBlank() }
-        .flatMap { listOf(cleanTitle(it), it.trim()) + it.split(" | ").map(::stripGroups) }
+        .flatMap { listOf(cleanTitle(it)) + it.split(" | ").map(::stripGroups) }
+        .map { it.replace(SPACES, " ").trim() }
         .filter { it.isNotBlank() }
         .distinctBy { it.lowercase() }
+
+    /**
+     * Raw gallery names (with their bracket groups) and parody tags: they let a search for the original series find
+     * the gallery as a related work, never as that series ([alexandria.core.model.SourceSeries.related]).
+     */
+    fun references(raw: List<String?>, parodies: List<String> = emptyList()): List<String> {
+        val own = raw.filterNotNull().flatMap { titles(it) }.map { it.lowercase() }.toSet()
+        return (raw.filterNotNull().map { it.replace(SPACES, " ").trim() } + parodies.map { it.trim() })
+            .filter { it.isNotBlank() && it.lowercase() !in own && !it.equals("original", true) }
+            .distinctBy { it.lowercase() }
+    }
 
     /** A gallery is one chapter. */
     fun chapter(sourceId: String, galleryId: String, uploadedAt: Long?, pageCount: Int?, webUrl: String) = SourceChapter(

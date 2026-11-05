@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.extension.all.libraryofalexandria
 import alexandria.core.config.AggregatorSettings
 import alexandria.core.config.MetadataPreference
 import alexandria.core.config.QualityMode
+import alexandria.core.config.SourcePolicy
 import android.content.SharedPreferences
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
@@ -12,9 +13,9 @@ import androidx.preference.SwitchPreferenceCompat
 
 /**
  * Native source settings, kept to the choices that actually change what users see. Everything else (deduplication,
- * missing-chapter recovery, fallback, timeouts, concurrency, caching) is always on and tunes itself; 18+ content is
- * always included. Only controls present in extensions-lib 1.6 are used. Values are read on every call, so changes
- * apply immediately.
+ * missing-chapter recovery, fallback, timeouts, concurrency, caching) is always on and tunes itself. Explicit-content
+ * providers sit behind the 18+ switch (off by default). Only controls present in extensions-lib 1.6 are used. Values
+ * are read on every call, so changes apply immediately.
  */
 object Settings {
 
@@ -35,12 +36,15 @@ object Settings {
     private const val ENABLED = "src_enabled"
     /** Provider ids that existed when the user last saved [ENABLED]; providers added later start enabled. */
     private const val KNOWN = "src_known"
-    /** Providers shipped before [KNOWN] was introduced (1.6.4). */
-    private val LEGACY_SOURCES = setOf("mangadex", "weebcentral", "mangapill", "mangakatana", "mangaread", "mgeko", "atsumaru")
     private const val LINKS = "src_manual_links"
+    /**
+     * Shows the explicit-content providers in [ADULT_SOURCES]. Off: they are never searched or read from. Exactly these
+     * six: Hiperdex, Omega Scans, ManhwaRead and mixed providers follow their own source checkbox (see [SourcePolicy]).
+     */
+    private const val ADULT = "src_adult"
+    val ADULT_SOURCES = SourcePolicy.EXPLICIT_SOURCES
     private const val DEEP = "src_deep_discovery"
     private const val CACHE_ACTION = "perf_cache_action"
-    private const val NONE = "__none__"
 
     // Settings from 1.6.4 and earlier, read once as defaults for the merged choices above.
     private const val OLD_QUALITY = "quality_opt"
@@ -54,19 +58,21 @@ object Settings {
         fun s(k: String, def: String) = runCatching { p.getString(k, def) }.getOrNull() ?: def
         val quality = s(QUALITY_LEVEL, legacyQuality(p))
         val metaSource = s(META_MODE, META_OFF)
+        val adult = b(ADULT, false)
+        val hidden = SourcePolicy.hidden(adult)
         return d.copy(
             highQualityCovers = b(COVER_HQ, d.highQualityCovers),
             qualityOptimization = quality != QUALITY_OFF,
             qualityMode = enumOr(quality, QualityMode.BEST),
             includeSpecials = b(SPECIALS, d.includeSpecials),
             showAlternativeTranslations = b(ALT_TL, d.showAlternativeTranslations),
-            preferredSource = s(PREFERRED_SOURCE, "auto").takeUnless { it == "auto" || it.isBlank() },
+            preferredSource = SourcePolicy.preferred(s(PREFERRED_SOURCE, "auto"), hidden),
             languages = listOf("en"), // the extension is English-only
             mangabaka = metaSource == "AUTO" || metaSource == "MANGABAKA",
             anilist = metaSource == "AUTO" || metaSource == "ANILIST",
             metadataPreference = enumOr(metaSource, MetadataPreference.AUTO),
             completenessChecking = b(COMPLETENESS, d.completenessChecking),
-            enabledSources = enabledSources(p, allSources),
+            enabledSources = SourcePolicy.effective(enabledSources(p, allSources), allSources, hidden),
             manualLinks = AggregatorSettings.parseManualLinks(s(LINKS, "")),
             deepDiscovery = b(DEEP, d.deepDiscovery),
         )
@@ -80,16 +86,20 @@ object Settings {
      * Never-configured = all providers; an explicitly emptied selection must mean none, not all. Providers added
      * after the selection was saved are enabled, so a saved list from an older version does not hide them.
      */
-    private fun enabledSources(p: SharedPreferences, allSources: List<String>): Set<String> {
-        val stored = runCatching { p.getStringSet(ENABLED, null) }.getOrNull()?.toSet() ?: return emptySet()
-        val known = runCatching { p.getStringSet(KNOWN, null) }.getOrNull()?.toSet() ?: LEGACY_SOURCES
-        return (stored + (allSources - known)).ifEmpty { setOf(NONE) }
-    }
+    private fun enabledSources(p: SharedPreferences, allSources: List<String>): Set<String> = SourcePolicy.selected(
+        stored = runCatching { p.getStringSet(ENABLED, null) }.getOrNull()?.toSet(),
+        known = runCatching { p.getStringSet(KNOWN, null) }.getOrNull()?.toSet(),
+        allSources = allSources,
+    )
 
     private inline fun <reified E : Enum<E>> enumOr(v: String, def: E): E = runCatching { enumValueOf<E>(v.uppercase()) }.getOrDefault(def)
 
-    fun build(screen: PreferenceScreen, p: SharedPreferences, sources: List<Pair<String, String>>, onAction: (Action) -> Unit) {
+    fun build(screen: PreferenceScreen, p: SharedPreferences, allSources: List<Pair<String, String>>, onAction: (Action) -> Unit) {
         val ctx = screen.context
+        val adult = runCatching { p.getBoolean(ADULT, false) }.getOrDefault(false)
+        // Explicit providers are not listed while 18+ is off; their saved on/off choices are kept for when it is on.
+        val sources = if (adult) allSources else allSources.filter { it.first !in ADULT_SOURCES }
+        val allIds = allSources.map { it.first }
 
         fun switch(key: String, title: String, summary: String, def: Boolean) = screen.addPreference(
             SwitchPreferenceCompat(ctx).apply {
@@ -155,14 +165,25 @@ object Settings {
                 entries = sources.map { it.second }.toTypedArray()
                 entryValues = sources.map { it.first }.toTypedArray()
                 // Show providers added since the selection was saved as enabled, matching read().
-                val current = enabledSources(p, sources.map { it.first }).ifEmpty { sources.map { it.first }.toSet() }
-                setDefaultValue(sources.map { it.first }.toSet())
-                if (p.contains(ENABLED)) values = current
-                setOnPreferenceChangeListener { _, _ ->
-                    p.edit().putStringSet(KNOWN, sources.map { it.first }.toSet()).apply()
-                    true
+                val current = enabledSources(p, allIds).ifEmpty { allIds.toSet() }
+                setDefaultValue(allIds.toSet())
+                if (p.contains(ENABLED)) values = current.filter { id -> sources.any { it.first == id } }.toSet()
+                setOnPreferenceChangeListener { pref, value ->
+                    @Suppress("UNCHECKED_CAST")
+                    val chosen = (value as? Set<String>).orEmpty()
+                    // Keep the choices for providers this list does not show (18+ off).
+                    val listed = sources.map { it.first }
+                    val saved = SourcePolicy.saveEdit(chosen, enabledSources(p, allIds), allIds, listed)
+                    (pref as MultiSelectListPreference).values = chosen
+                    p.edit().putStringSet(ENABLED, saved).putStringSet(KNOWN, allIds.toSet()).apply()
+                    false // saved above, together with the unlisted choices
                 }
             },
+        )
+        switch(
+            ADULT, "18+ content",
+            "Include explicit providers (Hentai20, Hentai2Read, nhentai, Hitomi, E-Hentai, Pururin). Reopen settings to see them in the source lists.",
+            false,
         )
         switch(
             DEEP, "Search every source",

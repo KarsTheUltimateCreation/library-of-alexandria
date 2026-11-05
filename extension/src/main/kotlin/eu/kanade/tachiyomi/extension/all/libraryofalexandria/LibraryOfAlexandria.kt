@@ -94,7 +94,11 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
 
     override val client: OkHttpClient by lazy {
         network.client.newBuilder()
-            .addInterceptor(FallbackInterceptor({ aggregatorOrNull?.reader }, { settings() }))
+            .addInterceptor(
+                FallbackInterceptor({ aggregatorOrNull?.reader }, { settings() }) { url, provider ->
+                    aggregatorOrNull?.allowsImage(url, provider, settings()) ?: true
+                },
+            )
             .addInterceptor(ImageHeaderInterceptor({ runCatching { aggregator.registry }.getOrNull() }, DEFAULT_REFERER))
             .build()
     }
@@ -103,7 +107,14 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
 
     private val aggregator: Aggregator by lazy {
         // Confirmed provider links get their own budget so cover and metadata churn never evicts them.
-        val cache = CacheManager(store, maxPersistedEntries = 250, groupLimits = mapOf("state:" to 400, "idx:" to 2000, "rej:" to 300, "cimg:" to 600, "cover:best:" to 400))
+        val cache = CacheManager(
+            store, maxPersistedEntries = 250,
+            groupLimits = mapOf(
+                "state:" to 400, "idx:" to 2000, "rej:" to 300, "cimg:" to 600, "cover:best:" to 400,
+                // Identities of one work saved under several keys, and numbered-part series ids (1.6.10).
+                "canon:" to 400, "aliases:" to 400, "vid:" to 600,
+            ),
+        )
         val lists = CacheManager(listStore, maxPersistedEntries = MAX_STORED_LISTS, maxPersistedChars = MAX_STORED_LIST_CHARS)
         val health = ProviderHealth(store)
         val ctx = AdapterContext(client, json, userAgent)
@@ -328,7 +339,7 @@ class LibraryOfAlexandria : HttpSource(), ConfigurableSource {
     private fun writeMemo(manga: SManga, state: SeriesState) {
         runCatching {
             // Only links travel in the memo; metadata is re-fetchable and would bloat the host database.
-            fun slim(b: alexandria.core.Binding) = b.copy(series = b.series.copy(description = null, altTitles = b.series.altTitles.take(5), genres = emptyList()))
+            fun slim(b: alexandria.core.Binding) = b.copy(series = b.series.copy(description = null, altTitles = b.series.altTitles.take(5), genres = emptyList(), related = emptyList()))
             val slim = state.copy(metadata = null, bindings = state.bindings.mapValues { slim(it.value) }, spares = state.spares.mapValues { slim(it.value) })
             manga.memo = JsonObject(manga.memo + (MEMO_STATE to json.encodeToJsonElement(SeriesState.serializer(), slim)))
         }

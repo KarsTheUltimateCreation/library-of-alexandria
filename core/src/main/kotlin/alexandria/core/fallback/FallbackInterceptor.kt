@@ -1,6 +1,7 @@
 package alexandria.core.fallback
 
 import alexandria.core.config.AggregatorSettings
+import alexandria.core.config.SourcePolicy
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -41,6 +42,11 @@ import java.util.Base64
 class FallbackInterceptor(
     private val reader: () -> ReaderResolver?,
     private val settings: () -> AggregatorSettings,
+    /**
+     * Whether a cover image (URL, provider when known) may be loaded under the current source policy. Alternatives
+     * a disabled provider serves are skipped; so is a primary cover of one when an allowed alternative exists.
+     */
+    private val imageAllowed: (String, String?) -> Boolean = { _, _ -> true },
 ) : Interceptor {
 
     private val gate = Semaphore(2)
@@ -60,13 +66,16 @@ class FallbackInterceptor(
         val parsed = decodePageToken(token)
         val resolver = reader()
         val resolution = parsed?.let { resolver?.recentResolution(it.chapterRef) }
-        val recoverable = s.sourceFallback && resolver != null && resolution != null && resolution.fallbacks.isNotEmpty()
-        val primaryFailure = attempt(chain, request, buffer = recoverable)
+        // The source policy as it is now, not as it was when the resolution was prepared (18+ switched off since).
+        val fallbacks = resolution?.fallbacks.orEmpty().filter { SourcePolicy.allows(s, it.sourceId) }
+        val recoverable = s.sourceFallback && resolver != null && resolution != null && fallbacks.isNotEmpty()
+        val primaryAllowed = parsed?.sourceId?.let { SourcePolicy.allows(s, it) } ?: true
+        val primaryFailure = if (primaryAllowed) attempt(chain, request, buffer = recoverable) else Attempt(null, IOException("${parsed?.sourceId} is disabled in the source settings"))
         if (primaryFailure.response != null) return primaryFailure.response
         if (!recoverable || parsed == null) throw primaryFailure.error!!
         val (chapterRef, index) = parsed.chapterRef to parsed.index
 
-        for (alt in resolution.fallbacks.take(MAX_ALTERNATIVES)) {
+        for (alt in fallbacks.take(MAX_ALTERNATIVES)) {
             val pages = runCatching {
                 runBlocking { gate.withPermit { resolver.alternatePages(chapterRef, alt, s) } }
             }.getOrNull() ?: continue
@@ -84,8 +93,13 @@ class FallbackInterceptor(
     }
 
     private fun withCoverFallback(chain: Interceptor.Chain, request: Request, token: String): Response {
-        val alternatives = if (settings().coverFallback) decodeCoverToken(token) else emptyList()
-        val primary = attempt(chain, request, buffer = alternatives.isNotEmpty())
+        val alternatives = (if (settings().coverFallback) decodeCoverToken(token) else emptyList())
+            .filter { runCatching { imageAllowed(it.u, it.p) }.getOrDefault(true) }
+        val primaryAllowed = runCatching { imageAllowed(request.url.toString(), null) }.getOrDefault(true)
+        // A cover stored by the host before its provider was disabled: an allowed alternative is used instead. With
+        // none, the host's own library thumbnail still loads (the next refresh replaces it).
+        val primary = if (primaryAllowed || alternatives.isEmpty()) attempt(chain, request, buffer = alternatives.isNotEmpty())
+        else Attempt(null, IOException("cover provider disabled"))
         if (primary.response != null) return primary.response
         if (alternatives.isEmpty()) throw primary.error!!
         for ((i, alt) in alternatives.withIndex()) {
@@ -164,7 +178,7 @@ class FallbackInterceptor(
     data class PageToken(val chapterRef: String, val index: Int, val sourceId: String?)
 
     @Serializable
-    data class CoverAlt(val u: String, val h: Map<String, String> = emptyMap())
+    data class CoverAlt(val u: String, val h: Map<String, String> = emptyMap(), val p: String? = null)
 
     companion object {
         const val PAGE_PREFIX = "loa-p="

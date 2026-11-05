@@ -57,6 +57,7 @@ class PururinAdapter(ctx: AdapterContext, override val baseUrl: String = "https:
                 id = sid,
                 title = Galleries.cleanTitle(raw),
                 altTitles = Galleries.titles(a.attr("title")).filter { !it.equals(Galleries.cleanTitle(raw), true) },
+                related = Galleries.references(listOf(raw, a.attr("title"))),
                 coverUrl = a.selectFirst("img.card-img-top")?.attr("abs:src")?.takeIf { it.isNotBlank() },
                 kind = ContentKind.OTHER,
                 status = PublicationStatus.COMPLETED,
@@ -75,6 +76,7 @@ class PururinAdapter(ctx: AdapterContext, override val baseUrl: String = "https:
         return series.copy(
             title = Galleries.cleanTitle(title),
             altTitles = Galleries.titles(full).filter { !it.equals(Galleries.cleanTitle(title), true) },
+            related = Galleries.references(listOf(title, full), row("Parody")),
             coverUrl = doc.selectFirst("img.cover")?.attr("abs:src")?.takeIf { it.isNotBlank() } ?: series.coverUrl,
             authors = (row("Artist") + row("Circle")).distinct(),
             genres = (row("Category") + row("Contents")).distinct(),

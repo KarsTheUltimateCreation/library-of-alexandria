@@ -13,7 +13,7 @@ infrastructure is a static GitHub repository.
 Since **1.6.7** it works from the providers' own information alone: by default it makes **no requests to
 MangaBaka, AniList or any other metadata service** (MangaBaka/AniList remain an optional enhancement).
 
-> Status: early release — current version **1.6.9** ([release notes](https://github.com/KarsTheUltimateCreation/library-of-alexandria/releases)).
+> Status: early release — current version **1.6.10** ([release notes](https://github.com/KarsTheUltimateCreation/library-of-alexandria/releases)).
 > See [Compatibility](docs/COMPATIBILITY.md) for exactly what has and has not been verified on each app.
 
 ## Install
@@ -33,7 +33,7 @@ Requires an app supporting extension lib **1.6** (Mihon 0.21+, Tachimanga 4.16+)
 
 | Feature | How |
 |---|---|
-| Multi-source search | The five most relevant healthy providers first (all of them when they find little, or when you scroll past the end of the results); the results page never waits more than 6 s for a provider — unless nothing was found, when every remaining provider is asked with up to 15 s before reporting no results (a bulk migration searches while the library updates). One series is one result even when sites name it differently (one site's title is another's alternative title), a site lists it twice, or credits its authors under other spellings; each result is named after the title closest to the search. With external metadata enabled, MangaBaka (or AniList) is searched too |
+| Multi-source search | The five most relevant healthy providers first (all of them when they find nothing confident, or when you scroll past the end of the results); once an exact match is in, the others get 1.5 s more and the rest arrive on the next page; the results page never waits more than 6 s for a provider — unless nothing was found, when every remaining provider is asked with up to 15 s before reporting no results (a bulk migration searches while the library updates). One series is one result even when sites name it differently (one site's title is another's alternative title), a site lists it twice, or credits its authors under other spellings; each result is named after the title closest to the search. A work saved under two identities (e.g. "Attack on Titan" and "ATTACK ON TITAN" from different sites, with the same id or the same title and authors) is shown as one of them, and a work keeps the result it was first shown as on later pages; both old entries keep working. A gallery that only *references* a series (a parody) is a separate, lower-ranked result. With external metadata enabled, MangaBaka (or AniList) is searched too |
 | Sources per series | At most 5 linked sources are read from and refreshed per series; further confirmed matches are kept as *spares* and promoted without a new search when a linked source fails or chapters are missing. Older series with more links are trimmed only of sources that add no chapter of their own — the cap never costs a chapter |
 | Request control | Each service's request rate adapts: a 429 halves it, it recovers gradually once the 429s stop. Library updates refresh the two providers furthest ahead on every update and the other linked ones at most every 6 h; searches made by library updates draw on a shared per-provider budget (6/min) and widen to every provider at most twice a day per series; identical provider searches and detail lookups are shared between search, linking and updates for 20 min |
 | Speed | Per-request network timeouts adapt to each provider's measured latency and start only when a request is actually sent; a failing provider cools down (2 → 30 min); a service's `Retry-After` (seconds or HTTP date) pauses every caller of that service instead of being retried early; recent chapter lists are reused instead of refetched; identical concurrent requests are merged |
@@ -49,7 +49,9 @@ Requires an app supporting extension lib **1.6** (Mihon 0.21+, Tachimanga 4.16+)
 | Covers | Search results show the sharpest cover among the sites carrying the series (measured sizes, else each site's typical size; Google preview thumbnails last). Every linked source's cover (plus MangaBaka raw art / AniList when enabled) is measured at once — first 64 KB only, one 2.5 s budget, alongside the chapter list so it adds no wait — and sizes are remembered for 30 days; the highest resolution wins, scored by resolution, bytes/pixel (catches upscales and over-compression), aspect, authenticity, original-language edition; fallback to the next candidate if loading fails |
 | External metadata | Off by default. MangaBaka and/or AniList (catalogue details, original chapter count, catalogue filters and popular lists), cached and rate-limited, when enabled |
 
-English only, 18+ content included. Bundled providers:
+English only. Bundled providers (the **18+ content** switch, off by default, controls exactly Hentai20, Hentai2Read,
+NHentai, Hitomi, E-Hentai and Pururin; Hiperdex, Omega Scans, ManhwaRead and mixed catalogues follow their own source
+checkbox, so the switch is not a promise that every remaining result is non-adult):
 
 - **Series:** MangaDex (API, English chapters only; used for chapters, never for covers or standalone results),
   WeebCentral, MangaPill, MangaKatana, MangaRead, mgeko (mostly manhwa/manhua) and Atsumaru (API, several
@@ -78,7 +80,7 @@ untranslated range and metadata attribution.
 
 ## Settings
 
-Eleven settings, all optional. Deduplication, missing-chapter recovery, source fallback, timeouts, request pacing,
+Twelve settings, all optional. Deduplication, missing-chapter recovery, source fallback, timeouts, request pacing,
 concurrency and caching are always on and tune themselves.
 
 - **High-quality covers**
@@ -86,7 +88,9 @@ concurrency and caching are always on and tune themselves.
 - **Preferred source**, **Special chapters**, **Separate translations**
 - **External metadata** – **Off** (default, no requests to metadata services) / MangaBaka + AniList / MangaBaka only /
   AniList only; **Source report** in the description
-- **Sources** – enabled providers; **Search every source** (thorough discovery when a series is opened, and every
+- **Sources** – enabled providers; **18+ content** (off by default; while off, the six explicit providers are not listed,
+  searched, linked, read from or used for covers or fallback, and their saved on/off choices are kept — reopen settings
+  to see the source lists change); **Search every source** (thorough discovery when a series is opened, and every
   provider on the first search page); **Manual series links** (`p:mangapill:<id> = weebcentral:<id>, mangadex:-`;
   older entries use their `mb:`/`al:` id). Removing a line returns that series to automatic matching.
 - **Clear cache**

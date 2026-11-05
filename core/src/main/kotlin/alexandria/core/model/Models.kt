@@ -203,7 +203,13 @@ data class SourceSeries(
     val webUrl: String? = null,
     /** True once details were fetched (alt titles, ids); search hits are often partial. */
     val detailed: Boolean = false,
+    /**
+     * Names that refer to *other* works: a gallery's raw name with its parody's original series in brackets, parody
+     * tags. They make the entry findable by those names but are never compared as its own titles (identity, grouping).
+     */
+    val related: List<String> = emptyList(),
 ) {
+    /** The work's own titles (never [related] references). */
     fun allTitles(): List<String> = (listOf(title) + altTitles).filter { it.isNotBlank() }.distinctBy { it.lowercase() }
 
     fun asMetadata(): SeriesMetadata = SeriesMetadata(

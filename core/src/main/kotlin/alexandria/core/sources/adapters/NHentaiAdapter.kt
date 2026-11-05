@@ -105,6 +105,7 @@ class NHentaiAdapter(private val ctx: AdapterContext, override val baseUrl: Stri
                 id = h.id.toString(),
                 title = Galleries.cleanTitle(raw),
                 altTitles = Galleries.titles(raw, h.japaneseTitle).drop(1),
+                related = Galleries.references(listOf(raw, h.japaneseTitle)),
                 coverUrl = h.thumbnail?.let { "$THUMBS/$it" },
                 kind = ContentKind.OTHER,
                 status = PublicationStatus.COMPLETED,
@@ -123,6 +124,7 @@ class NHentaiAdapter(private val ctx: AdapterContext, override val baseUrl: Stri
         return series.copy(
             title = Galleries.cleanTitle(g.title.pretty ?: raw),
             altTitles = Galleries.titles(raw, g.title.japanese).filter { !it.equals(Galleries.cleanTitle(g.title.pretty ?: raw), true) },
+            related = Galleries.references(listOf(raw, g.title.japanese), tags("parody")),
             coverUrl = g.cover?.let { "$THUMBS/${it.path}" } ?: series.coverUrl,
             authors = tags("artist") + tags("group"),
             genres = (tags("category") + tags("tag")).distinct(),

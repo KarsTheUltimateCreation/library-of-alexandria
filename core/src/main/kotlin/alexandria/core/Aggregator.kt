@@ -8,6 +8,7 @@ import alexandria.core.cache.mergeReleases
 import alexandria.core.completeness.CompletenessAnalyzer
 import alexandria.core.completeness.CompletenessReport
 import alexandria.core.config.AggregatorSettings
+import alexandria.core.config.SourcePolicy
 import alexandria.core.covers.CoverResolver
 import alexandria.core.covers.ScoredCover
 import alexandria.core.fallback.FallbackInterceptor
@@ -26,6 +27,7 @@ import alexandria.core.metadata.CatalogFilters
 import alexandria.core.metadata.MetadataResolver
 import alexandria.core.model.ContentKind
 import alexandria.core.model.CoverCandidate
+import alexandria.core.model.CoverOrigin
 import alexandria.core.model.PublicationStatus
 import alexandria.core.model.SeriesMetadata
 import alexandria.core.model.SourceChapter
@@ -42,11 +44,16 @@ import alexandria.core.reconciliation.Release
 import alexandria.core.sources.ProviderRole
 import alexandria.core.sources.SourceAdapter
 import alexandria.core.sources.SourceRegistry
+import alexandria.core.sources.CompositeIdentities
+import alexandria.core.sources.VolumeGroupingAdapter
 import alexandria.core.sources.VolumeSeries
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.currentCoroutineContext
@@ -93,6 +100,8 @@ data class SeriesState(
      * new search when a linked source fails or chapters are missing.
      */
     val spares: Map<String, Binding> = emptyMap(),
+    /** Last host library update of this entry (a chapters-only refresh carrying the entry's memo): it is in a library. */
+    val libraryAt: Long = 0,
 )
 
 /** One search/browse result. [hit] is the provider entry it was built from (for local filtering), when there is one. */
@@ -186,49 +195,141 @@ class Aggregator(
     /** Pixel count of a cover measured earlier, or 0 when unknown (never makes a request). */
     private fun knownPixels(url: String?): Long = url?.let { knownImage(it)?.pixels } ?: 0L
 
+    init {
+        // Numbered-part series keep the id they were first given across restarts (library entries stay attached).
+        val ids = CachedCompositeIdentities(cache)
+        registry.all.forEach { (it as? VolumeGroupingAdapter)?.identities = ids }
+    }
+
     /** Canonical chapters per series kept in memory for page resolution (bounded: long sessions browse many series). */
     private val canonical = BoundedCache<String, Map<String, CanonicalChapter>>(CANONICAL_SERIES)
     private val chapterFlights = SingleFlight<String, List<SourceChapter>?>()
 
     // ---------------------------------------------------------------- search
 
-    /** A computed first search page: its cards, every provider hit, and which providers were asked. */
-    private class SearchPage(val at: Long, val cards: List<SeriesCard>, val hits: Map<String, List<SourceSeries>>, val searched: Set<String>, val more: Boolean)
+    /**
+     * A search session: the cards shown so far (every page), every provider hit, the providers that answered, and the
+     * card each provider entry was shown in ([pins], "sourceId:seriesId" -> card key). Later pages and late answers
+     * add to the cards a work was already shown under instead of showing it again under another key.
+     */
+    private class SearchPage(
+        val at: Long,
+        val cards: List<SeriesCard>,
+        val hits: Map<String, List<SourceSeries>>,
+        val searched: Set<String>,
+        val more: Boolean,
+        val pins: Map<String, String> = emptyMap(),
+        /** Providers the page did not wait for, completed in the background ([completeInBackground]). */
+        val background: List<SourceAdapter> = emptyList(),
+    )
 
     /** Recent search results; hosts re-run the same search when navigating back. Kept (stale) for outages. */
     private val searchCache = ConcurrentHashMap<String, SearchPage>()
+
+    /** Identical searches at the same time (a host asking twice, a migration and the user) share one session. */
+    private val sessionFlights = SingleFlight<String, SearchPage>()
+    private val nextPageFlights = SingleFlight<String, Pair<List<SeriesCard>, Boolean>>()
 
     suspend fun search(query: String, settings: AggregatorSettings): List<SeriesCard> = searchPage(query, 1, settings).first
 
     /**
      * Search results page by page. Page 1 asks the most relevant healthy providers (and widens on its own when they
-     * find little); a further page — the host asks for it when the user scrolls past the end — asks the remaining
-     * providers. With *Search every source* on, page 1 asks all of them.
+     * find nothing confident); a further page — the host asks for it when the user scrolls past the end — asks the
+     * remaining providers, and those page 1 did not wait for. With *Search every source* on, page 1 asks all of them.
      */
     suspend fun searchPage(query: String, page: Int, settings: AggregatorSettings): Pair<List<SeriesCard>, Boolean> {
         val q = SearchRelevance.cleanQuery(query)
         val cacheKey = q.lowercase() + "|" + settings.searchFingerprint()
-        val fresh = searchCache[cacheKey]?.takeIf { clock() - it.at < SEARCH_CACHE_MS }
-        val first = fresh ?: searchFirstPage(q, settings, searchCache[cacheKey]).also {
-            if (searchCache.size > 50) searchCache.clear()
-            // An empty page is not kept: asking again (the user retrying a title a migration missed) searches again.
-            if (it.cards.isNotEmpty()) searchCache[cacheKey] = it
-        }
+        val first = firstPage(q, cacheKey, settings)
         if (page <= 1) return first.cards to first.more
         if (!first.more) return emptyList<SeriesCard>() to false
-        val rest = registry.enabled(settings, includeUnhealthy = false).filter { it.id !in first.searched }
-        val hits = searchProviders(listOf(q), settings, rest, deadlineMs = SEARCH_DEADLINE_MS)
+        return nextPageFlights.run(cacheKey) { nextPage(q, cacheKey, first, settings) }
+    }
+
+    private suspend fun firstPage(q: String, cacheKey: String, settings: AggregatorSettings): SearchPage {
+        fun fresh() = searchCache[cacheKey]?.takeIf { clock() - it.at < SEARCH_CACHE_MS }
+        fresh()?.let { return it }
+        return sessionFlights.run(cacheKey) {
+            fresh() ?: searchFirstPage(q, settings, searchCache[cacheKey]).also {
+                if (searchCache.size > 50) searchCache.clear()
+                // An empty page is not kept: asking again (the user retrying a title a migration missed) searches again.
+                if (it.cards.isNotEmpty()) {
+                    searchCache[cacheKey] = it
+                    if (it.background.isNotEmpty()) completeInBackground(q, cacheKey, it, settings)
+                }
+            }
+        }
+    }
+
+    /** Background completion of a search session, per card key it may add links to (see [completeInBackground]). */
+    private val sessionWork = ConcurrentHashMap<String, kotlinx.coroutines.Job>()
+    private val sessionGate = Semaphore(SESSION_JOBS)
+
+    /**
+     * The providers a first page did not wait for (still answering, or the wider search an exact match made
+     * unnecessary for the page) finish in the background, as 1.6.9 asked them in the foreground. Their copies of works
+     * already shown join those cards as hints, so opening a result still links every source that carries it (their
+     * extras and side stories included); their other works wait for page 2. Same requests as 1.6.9, none extra:
+     * providers still running are joined, not asked again. Owned by [coverScope], bounded by [sessionGate].
+     */
+    private fun completeInBackground(q: String, cacheKey: String, page: SearchPage, settings: AggregatorSettings) {
+        // Opening a result waits only for providers that could be linked to it: general series sites. Adult-only and
+        // gallery sites are never linked to a general series (see [SourceRegistry.forLinking]); they finish unawaited.
+        val (linkable, others) = page.background.partition { it.role == ProviderRole.SERIES && !it.adult }
+        val job = completeWith(q, cacheKey, page, settings, linkable)
+        completeWith(q, cacheKey, page, settings, others)
+        if (job == null) return
+        page.cards.forEach { sessionWork[it.key.value] = job }
+        job.invokeOnCompletion { page.cards.forEach { c -> sessionWork.remove(c.key.value, job) } }
+    }
+
+    private fun completeWith(q: String, cacheKey: String, page: SearchPage, settings: AggregatorSettings, adapters: List<SourceAdapter>): kotlinx.coroutines.Job? {
+        if (adapters.isEmpty()) return null
+        return coverScope.launch {
+            sessionGate.withPermit {
+                val (hits, done) = gatherProviders(listOf(q), settings, adapters, deadlineMs = SEARCH_DEADLINE_MS)
+                hits.forEach { (sid, list) -> list.forEach { registry.noteImage(it.coverUrl, sid) } }
+                searchCache.computeIfPresent(cacheKey) { _, cur ->
+                    if (cur.at != page.at) {
+                        cur
+                    } else {
+                        val all = cur.hits + hits
+                        val ranked = providerCards(q, all, settings, emptySet(), cur.pins, late = true) // adds the hints
+                        SearchPage(cur.at, cur.cards, all, cur.searched + done, cur.more, pinsOf(ranked) + cur.pins)
+                    }
+                }
+            }
+        }
+    }
+
+    /** The providers page 1 did not ask or did not wait for; their new results only (works already shown stay put). */
+    private suspend fun nextPage(q: String, cacheKey: String, first: SearchPage, settings: AggregatorSettings): Pair<List<SeriesCard>, Boolean> {
+        // The session may have moved on while this request waited for an identical one.
+        val session = searchCache[cacheKey]?.takeIf { it.at == first.at } ?: first
+        if (!session.more) return emptyList<SeriesCard>() to false
+        val rest = registry.enabled(settings, includeUnhealthy = false).filter { it.id !in session.searched }
+        val (hits, finished) = timed("search.providers") { gatherProviders(listOf(q), settings, rest, deadlineMs = SEARCH_DEADLINE_MS) }
         hits.forEach { (sid, list) -> list.forEach { registry.noteImage(it.coverUrl, sid) } }
-        val shown = first.cards.map { it.key.value }.toSet()
-        val cards = providerCards(q, first.hits + hits, settings, emptySet()).map { it.card }.filter { it.key.value !in shown }
-        searchCache[cacheKey] = SearchPage(first.at, first.cards, first.hits + hits, first.searched + rest.map { it.id }, more = false)
+        val all = session.hits + hits
+        val ranked = timed("search.grouping") { providerCards(q, all, settings, emptySet(), session.pins) }
+        val shown = session.cards.map { it.key.value }.toSet()
+        val cards = ranked.map { it.card }.filter { it.key.value !in shown }.distinctBy { it.key.value }
+        // The session keeps every card shown so far: asking for page 1 again (navigating back) shows them all.
+        searchCache.compute(cacheKey) { _, cur ->
+            // Merged with what the background completion may have added meanwhile.
+            val base = cur?.takeIf { it.at == session.at } ?: session
+            SearchPage(base.at, base.cards + cards.filter { c -> base.cards.none { it.key == c.key } }, base.hits + hits, base.searched + finished + rest.map { it.id }, more = false, pinsOf(ranked) + base.pins)
+        }
         return cards to false
     }
 
     private fun AggregatorSettings.searchFingerprint() =
         listOf(mangabaka, anilist, metadataPreference, enabledSources.sorted(), languages, highQualityCovers, deepDiscovery).hashCode()
 
-    private class Ranked(val card: SeriesCard, val score: Double, val order: Int)
+    private class Ranked(val card: SeriesCard, val score: Double, val order: Int, val members: List<SourceSeries> = emptyList())
+
+    private fun pinsOf(ranked: List<Ranked>): Map<String, String> =
+        ranked.flatMap { r -> r.members.map { "${it.sourceId}:${it.id}" to r.card.key.value } }.toMap()
 
     /** Providers for the first search page, and the rest (searched on demand or when the first ones find little). */
     private fun searchTiers(settings: AggregatorSettings): Pair<List<SourceAdapter>, List<SourceAdapter>> {
@@ -250,38 +351,62 @@ class Aggregator(
             if (settings.externalMetadata) metadata.search(query, settings).filter { it.kind == ContentKind.UNKNOWN || it.kind.isComic || it.kind == ContentKind.OTHER } else emptyList()
         }
         val (tier1, tier2) = searchTiers(settings)
-        // Provider hits only pre-link entries; a slow provider must not hold up the results page.
-        var hits = searchProviders(listOf(query), settings, tier1, deadlineMs = SEARCH_DEADLINE_MS)
-        var searched = tier1.map { it.id }.toSet()
-        val metas = metaD.await()
-        // Little found among the main providers (an adult title, a doujinshi, a rare series): ask the others right away.
-        // Busy providers (long rate-limit queue) are left for page 2, which the user asks for by scrolling.
-        val widen = tier2.filter { backlog(it.id) < BUSY_MS }
-        if (widen.isNotEmpty() && metas.size < 3 && relevantTitles(query, hits) < FEW_RESULTS) {
-            hits = hits + searchProviders(listOf(query), settings, widen, deadlineMs = SEARCH_DEADLINE_MS)
-            searched = searched + widen.map { it.id }
+        // Provider hits only pre-link entries; a slow provider must not hold up the results page. Once a confident
+        // match is in, the others get a short grace period; those still running finish in the background and are
+        // part of page 2.
+        var (hits, searched) = timed("search.providers") {
+            gatherProviders(listOf(query), settings, tier1, deadlineMs = SEARCH_DEADLINE_MS, enough = { confident(query, it) })
         }
-        var cards = rankFirstPage(query, hits, metas, settings)
-        if (cards.isEmpty()) {
+        val metas = metaD.await()
+        // Nothing confident among the main providers (an adult title, a doujinshi, a rare series): ask the others right
+        // away. One exact match is enough; busy providers (long rate-limit queue) are left for page 2.
+        val widen = tier2.filter { backlog(it.id) < BUSY_MS }
+        if (widen.isNotEmpty() && metas.size < 3 && !confident(query, hits)) {
+            val (more, done) = timed("search.providers") {
+                gatherProviders(listOf(query), settings, widen, deadlineMs = SEARCH_DEADLINE_MS, enough = { confident(query, hits + it) })
+            }
+            hits = hits + more
+            searched = searched + done
+        }
+        // An exact match answered the page, but so few relevant titles that 1.6.9 would have widened: the wider search
+        // still runs, in the background, for coverage (links and chapters), not for the page.
+        val deferred = if (widen.isNotEmpty() && metas.size < 3 && widen.none { it.id in searched } && relevantTitles(query, hits) < FEW_RESULTS) widen else emptyList()
+        var ranked = timed("search.grouping") { rankFirstPage(query, hits, metas, settings) }
+        if (ranked.first.isEmpty()) {
             // Nothing at all. Under load (a bulk migration searches title after title while those series are being
             // updated) the providers asked may have been busy, cooling down or cut off by the deadline, and "no results"
             // makes the host report the title as missing. Ask every enabled provider that has not answered, with more
             // time, before reporting nothing.
             val rest = registry.enabled(settings).filter { it.id !in hits.keys }
             if (rest.isNotEmpty()) {
-                hits = hits + searchProviders(listOf(query), settings, rest, deadlineMs = RESCUE_DEADLINE_MS)
-                searched = searched + rest.map { it.id }
-                cards = rankFirstPage(query, hits, metas, settings)
+                val (more, done) = timed("search.providers") {
+                    gatherProviders(listOf(query), settings, rest, deadlineMs = RESCUE_DEADLINE_MS, enough = { confident(query, hits + it) })
+                }
+                hits = hits + more
+                searched = searched + done
+                ranked = timed("search.grouping") { rankFirstPage(query, hits, metas, settings) }
             }
         }
         hits.forEach { (sid, list) -> list.forEach { registry.noteImage(it.coverUrl, sid) } }
         // Every provider failed (offline, outage): show the last results instead of nothing.
-        if (cards.isEmpty() && stale != null) return@coroutineScope stale
-        SearchPage(clock(), cards, hits, searched, more = searched.size < tier1.size + tier2.size)
+        if (ranked.first.isEmpty() && stale != null) return@coroutineScope stale
+        val askable = (tier1 + tier2).map { it.id }
+        val pending = (tier1 + tier2).filter { it.id !in searched && (it in tier1 || it in deferred) }
+        SearchPage(clock(), ranked.first, hits, searched, more = askable.any { it !in searched }, pins = ranked.second, background = pending)
     }
 
-    /** Catalogue records and provider hits of a first search page as ranked, de-duplicated cards. */
-    private fun rankFirstPage(query: String, hits: Map<String, List<SourceSeries>>, metas: List<SeriesMetadata>, settings: AggregatorSettings): List<SeriesCard> {
+    /**
+     * Enough to answer now: an exact title match (the entry's own titles, from a provider whose hits can be results),
+     * or [FEW_RESULTS] relevant titles.
+     */
+    private fun confident(query: String, hits: Map<String, List<SourceSeries>>): Boolean {
+        val exact = hits.filterKeys { registry[it]?.standaloneResults != false }.values.flatten()
+            .any { it.kind != ContentKind.NOVEL && SearchRelevance.score(query, it.allTitles()) >= 1.0 }
+        return exact || relevantTitles(query, hits) >= FEW_RESULTS
+    }
+
+    /** Catalogue records and provider hits of a first search page as ranked, de-duplicated cards, and their pins. */
+    private fun rankFirstPage(query: String, hits: Map<String, List<SourceSeries>>, metas: List<SeriesMetadata>, settings: AggregatorSettings): Pair<List<SeriesCard>, Map<String, String>> {
         val claimed = mutableSetOf<Pair<String, String>>()
         val ranked = mutableListOf<Ranked>()
         for (m in metas) {
@@ -294,47 +419,74 @@ class Aggregator(
             val card = SeriesCard(key, m.displayTitle, quickCover(m, matched.map { it.second.first }, settings))
             // Entries some provider already carries are readable right away: a small boost among equals.
             val score = SearchRelevance.score(query, m.allTitles()) + if (matched.isNotEmpty()) 0.03 else 0.0
-            ranked += Ranked(card, score, ranked.size)
+            ranked += Ranked(card, score, ranked.size, matched.map { it.second.first })
         }
-        ranked += providerCards(query, hits, settings, claimed).map { Ranked(it.card, it.score, ranked.size + it.order) }
-        return ranked.sortedWith(compareByDescending<Ranked> { it.score }.thenBy { it.order }).map { it.card }.distinctBy { it.key.value }
+        val providers = providerCards(query, hits, settings, claimed)
+        ranked += providers.map { Ranked(it.card, it.score, ranked.size + it.order, it.members) }
+        val sorted = ranked.sortedWith(compareByDescending<Ranked> { it.score }.thenBy { it.order }).distinctBy { it.card.key.value }
+        return sorted.map { it.card } to pinsOf(sorted)
     }
 
     private fun relevantTitles(query: String, hits: Map<String, List<SourceSeries>>): Int =
         hits.values.flatten().filter { SearchRelevance.score(query, it.allTitles()) >= RELEVANT }.map { TitleNormalizer.compact(it.title) }.toSet().size
 
     /**
-     * Provider hits as results: grouped by [SearchClusterer] (same title or shared ids, nothing contradictory), shown
-     * under the series they are already linked to when there is one. Only close matches are kept: provider search is
-     * fuzzy ("don't tell mom" also returns "Don Dracula").
+     * How well a hit answers [query]: its own titles; a name that only refers to another work (a parody's original
+     * series) counts for much less, so related works can be found but rank after the work itself.
      */
-    private fun providerCards(query: String, hits: Map<String, List<SourceSeries>>, settings: AggregatorSettings, claimed: Set<Pair<String, String>>): List<Ranked> {
+    private fun relevanceOf(query: String, s: SourceSeries): Double =
+        maxOf(SearchRelevance.score(query, s.allTitles()), if (s.related.isEmpty()) 0.0 else RELATED_WEIGHT * SearchRelevance.score(query, s.related))
+
+    /**
+     * Provider hits as results: grouped by [SearchClusterer] (same title or shared ids, nothing contradictory), shown
+     * under the series they are already linked to when there is one, and under the card a hit was already shown in
+     * during this search session ([pins]). Only close matches are kept: provider search is fuzzy ("don't tell mom"
+     * also returns "Don Dracula").
+     */
+    private fun providerCards(
+        query: String,
+        hits: Map<String, List<SourceSeries>>,
+        settings: AggregatorSettings,
+        claimed: Set<Pair<String, String>>,
+        pins: Map<String, String> = emptyMap(),
+        /** Answers that arrived after the page: they may add hints to a result opened meanwhile, too. */
+        late: Boolean = false,
+    ): List<Ranked> {
         val pool = hits.flatMap { (sid, list) -> list.filter { (sid to it.id) !in claimed && it.kind != ContentKind.NOVEL } }
-            .filter { SearchRelevance.score(query, it.allTitles()) >= SearchRelevance.PROVIDER_HIT_MIN }
+            .filter { relevanceOf(query, it) >= SearchRelevance.PROVIDER_HIT_MIN }
         val clusters = SearchClusterer.cluster(
             pool,
-            keyOf = ::indexedKey,
-            rejected = { a, b -> (indexedKey(a) ?: SeriesKey.Provider(a.sourceId, a.id).value) in rejectedBy(b) },
+            keyOf = { s -> indexedKey(s)?.let(::canonicalOf) },
+            rejected = { a, b ->
+                val against = rejectedBy(b)
+                val k = indexedKey(a)
+                (k ?: SeriesKey.Provider(a.sourceId, a.id).value) in against || (k != null && canonicalOf(k) in against)
+            },
             priority = { sid -> registry.all.indexOfFirst { it.id == sid }.let { if (it < 0) Int.MAX_VALUE else it } },
             canAnchor = { sid -> registry[sid]?.standaloneResults != false },
             // Numbered parts folded into one series are a series, whichever kind of site they came from.
             roleOf = { s -> if (VolumeSeries.isComposite(s.id)) ProviderRole.SERIES else registry[s.sourceId]?.role },
             relevance = { s -> SearchRelevance.score(query, s.title) },
+            choose = ::chooseIdentity,
         )
         return clusters.mapIndexed { i, c ->
             val anchor = c.anchor
-            val key = c.key?.let { SeriesKey.parse(it) } ?: SeriesKey.Provider(anchor.sourceId, anchor.id)
-            if (c.key == null) {
-                rememberHints(key, null, c.members.associate { it.sourceId to Binding(it, if (it == anchor) 1.0 else 0.8, "search title", hint = it != anchor) })
+            if (c.aliases.isNotEmpty()) c.key?.let { recordAliases(it, c.aliases) }
+            // Within a session a work keeps the card it was first shown as (a higher-priority provider answering later
+            // would otherwise head the result and change its key).
+            val pinned = c.members.firstNotNullOfOrNull { pins["${it.sourceId}:${it.id}"] }?.let { SeriesKey.parse(it) }
+            val key = pinned ?: c.key?.let { SeriesKey.parse(it) } ?: SeriesKey.Provider(anchor.sourceId, anchor.id)
+            if (c.key == null || pinned != null) {
+                rememberHints(key, null, c.members.associate { it.sourceId to Binding(it, if (it == anchor) 1.0 else 0.8, "search title", hint = it != anchor) }, intoSaved = late && pinned != null)
             }
             // The sharpest cover: measured earlier (no request), else each source's typical cover size; then preference.
             val byPreference = c.members.sortedWith(compareByDescending<SourceSeries> { coverPixels(it) }.thenBy { settings.sourceRank(it.sourceId) })
-            val cover = c.key?.let { bestKnownCover(it) }?.takeIf { settings.externalMetadata || METADATA_PROVIDERS.none { m -> m in it } }
+            val cover = bestKnownCover(key.value, settings)?.takeIf { settings.externalMetadata || METADATA_PROVIDERS.none { m -> m in it } }
                 ?: byPreference.filter { registry[it.sourceId]?.standaloneResults != false }.firstNotNullOfOrNull { it.coverUrl }
             // A grouped result is shown under the name closest to what was searched: sites name one series differently
             // ("Apocalypse Bringer Mynoghra" / "… - World Conquest Begins with …"), and hosts match migrations on it.
-            val title = c.key?.let { storedTitle(it) } ?: closestTitle(query, c.members) ?: anchor.title
-            Ranked(SeriesCard(key, title, cover, anchor), SearchRelevance.score(query, c.members.flatMap { it.allTitles() }), i)
+            val title = (pinned?.value ?: c.key)?.let { storedTitle(it) } ?: closestTitle(query, c.members) ?: anchor.title
+            Ranked(SeriesCard(key, title, cover, anchor), c.members.maxOf { relevanceOf(query, it) }, i, c.members)
         }
     }
 
@@ -345,8 +497,10 @@ class Aggregator(
     private fun closestTitle(query: String, members: List<SourceSeries>): String? {
         // Word for word: some sites list run-together search aliases ("kaijuno 8", "towerof god") as titles.
         val q = TitleNormalizer.normalize(query)
-        members.map { it.title }.firstOrNull { TitleNormalizer.normalize(it) == q }?.let { return it }
-        members.flatMap { it.altTitles }.firstOrNull { TitleNormalizer.normalize(it) == q }?.let { return it }
+        // Among equal titles, normal case over a site's all-caps styling ("ATTACK ON TITAN" on Atsumaru).
+        fun List<String>.bestCase() = firstOrNull { t -> t.any { it.isLowerCase() } } ?: firstOrNull()
+        members.map { it.title }.filter { TitleNormalizer.normalize(it) == q }.bestCase()?.let { return it }
+        members.flatMap { it.altTitles }.filter { TitleNormalizer.normalize(it) == q }.bestCase()?.let { return it }
         val anchor = members.first().title
         val best = members.map { it.title }.maxByOrNull { SearchRelevance.score(query, it) } ?: return null
         return best.takeIf { SearchRelevance.score(query, it) > SearchRelevance.score(query, anchor) }
@@ -402,7 +556,7 @@ class Aggregator(
 
     /** A provider listing entry, shown as the series it is already linked to when there is one. */
     private fun providerCard(s: SourceSeries): SeriesCard {
-        val known = indexedKey(s)
+        val known = indexedKey(s)?.let(::canonicalOf)
         val key = known?.let { SeriesKey.parse(it) } ?: SeriesKey.Provider(s.sourceId, s.id)
         return SeriesCard(key, known?.let { storedTitle(it) } ?: s.title, s.coverUrl, s)
     }
@@ -467,10 +621,14 @@ class Aggregator(
         titleHint: String?,
         recovered: Map<String, String>,
     ): SeriesUpdate {
-        var state = recoverBindings(loadState(key, knownState), recovered, titleHint)
+        // Opened right after a search: its background completion may be about to add this result's other sources.
+        if (fetchDetails) sessionWork[key.value]?.let { job -> withTimeoutOrNull(SESSION_JOIN_MS) { job.join() } }
+        var state = absorbAliases(key, recoverBindings(loadState(key, knownState), recovered, titleHint))
         // A library update (chapters only) runs for every series at once: it shares a discovery budget and widens rarely.
         val background = !fetchDetails
         val gallery = isGallery(key)
+        // The host refreshing an entry it stored our memo in, chapters only: a library update, so a library entry.
+        if (background && fetchChapters && intent == Refresh.EXPLICIT && knownState != null) state = state.copy(libraryAt = clock())
 
         // 1. Details: the entry's own provider, plus the external record only when the user enabled one.
         if (fetchDetails || merged(state) == null) {
@@ -486,16 +644,27 @@ class Aggregator(
         var reference = merged(state)?.metadata ?: titleHint?.takeIf { it.isNotBlank() }?.let { SeriesMetadata(TITLE_ONLY, title = it) }
 
         // 2. Link providers: the most promising ones first (see resolveBindings), unless asked to be thorough.
-        if (reference != null) state = resolveBindings(key, reference, state, settings, deep = settings.deepDiscovery, background = background)
+        if (reference != null) state = timed("update.linking") { resolveBindings(key, reference, state, settings, deep = settings.deepDiscovery, background = background) }
         saveState(state)
         reference = merged(state)?.metadata ?: reference
 
-        // 3 + 4. Chapters and cover are independent: fetch them concurrently.
+        // 3 + 4. Chapters and cover are independent: fetch them concurrently. The cover is optional: it may delay the
+        //    update by at most COVER_WAIT_MS from here; after that the best cover already known is shown and the
+        //    comparison finishes in the background (bounded, owned by [coverScope]), cached for the next refresh.
         val linkedState = state
-        var (built, cover) = coroutineScope {
-            val chaptersD = async { if (fetchChapters) buildChapters(key, linkedState, settings, intent, background) else null }
-            val coverD = async { if (fetchDetails) resolveCover(key, linkedState, settings) else null }
-            chaptersD.await() to coverD.await()
+        val coverJob = if (fetchDetails) coverWork(key, linkedState, settings) else null
+        var (built, cover) = try {
+            coroutineScope {
+                val chaptersD = async { if (fetchChapters) timed("update.chapters") { buildChapters(key, linkedState, settings, intent, background) } else null }
+                val coverD = async { coverJob?.let { job -> withTimeoutOrNull(COVER_WAIT_MS) { job.await() } } }
+                val chapters = chaptersD.await()
+                // Chapters took longer than the cover's wait: a cover that finished meanwhile is used all the same.
+                val covers = coverD.await() ?: coverJob?.takeIf { it.isCompleted && !it.isCancelled }?.await()
+                chapters to (covers ?: coverJob?.let { knownCover(key, linkedState, settings) })
+            }
+        } catch (e: CancellationException) {
+            coverJob?.cancel() // the user left: nothing is waiting for this cover
+            throw e
         }
 
         // 5. Progressive discovery: search the remaining providers only when the linked ones leave chapters missing,
@@ -504,7 +673,7 @@ class Aggregator(
         // 5a. Over the cap (links made before it existed, or manual ones): let go of sources that add no chapter of
         //     their own. Sources that are the only ones with some chapter always stay: the cap never costs chapters.
         if (built != null && !gallery) {
-            pruneRedundant(key, state, built)?.let { pruned ->
+            pruneRedundant(key, state, built, enabledIds(settings))?.let { pruned ->
                 state = pruned
                 saveState(state)
             }
@@ -559,11 +728,12 @@ class Aggregator(
     /**
      * Bindings to drop so the series has at most [MAX_LINKED] linked sources: never the entry source or manual links,
      * never a source that is the only one listing some chapter; among the rest, the ones covering fewest chapters go
-     * first. Dropped matches become spares. Null when nothing changes.
+     * first. Dropped matches become spares. Null when nothing changes. Links to disabled providers (their checkbox, the
+     * 18+ switch) are neither counted nor dropped: they list nothing now only because they are not asked.
      */
-    private fun pruneRedundant(key: SeriesKey, state: SeriesState, built: Built): SeriesState? {
+    private fun pruneRedundant(key: SeriesKey, state: SeriesState, built: Built, enabled: Set<String>): SeriesState? {
         val anchor = (key as? SeriesKey.Provider)?.sourceId
-        val active = state.bindings.filterValues { !it.unverified }
+        val active = state.bindings.filter { (sid, b) -> !b.unverified && sid in enabled }
         if (active.size <= MAX_LINKED) return null
         val coverage = built.canonical.flatMap { it.sources.distinct() }.groupingBy { it }.eachCount()
         val unique = built.canonical.filter { it.sources.distinct().size == 1 }.map { it.sources.first() }.toSet()
@@ -808,6 +978,7 @@ class Aggregator(
     suspend fun resolveImage(pageRef: String, settings: AggregatorSettings): String {
         val token = FallbackInterceptor.pageToken(pageRef) ?: throw IllegalArgumentException("Not a Library of Alexandria page: $pageRef")
         val adapter = token.sourceId?.let { registry[it] } ?: throw IllegalStateException("Unknown provider for page $pageRef")
+        if (adapter.id !in enabledIds(settings)) throw IllegalStateException("${adapter.name} is disabled in the source settings")
         val page = registry.health.call(adapter.id, settings.requestTimeoutSeconds * 1000L) { adapter.resolveImage(FallbackInterceptor.stripTag(pageRef)) }
         return FallbackInterceptor.tagPage(page.imageUrl, token.chapterRef, token.index, adapter.id)
     }
@@ -831,6 +1002,7 @@ class Aggregator(
         background: Boolean = false,
     ): SeriesState {
         var state = state0
+        val enabled = enabledIds(settings)
         val configured = settings.manualLinks[key.value].orEmpty()
         // Manual links from settings win over automatic matching; a manual link removed from settings is dropped.
         state = state.copy(bindings = state.bindings.filterValues { b -> !b.manual || configured.any { it == "${b.series.sourceId}:${b.series.id}" } })
@@ -843,7 +1015,9 @@ class Aggregator(
             } else {
                 val existing = state.bindings[sid]
                 if (existing?.series?.id == id && existing.manual) state else {
-                    val series = cachedDetails(adapter, SourceSeries(sid, id, meta.title), settings) ?: SourceSeries(sid, id, meta.title)
+                    // A disabled provider (its checkbox, or the 18+ switch) is not asked: the link is kept, unused, for
+                    // when it is enabled again.
+                    val series = (if (sid in enabled) cachedDetails(adapter, SourceSeries(sid, id, meta.title), settings) else null) ?: SourceSeries(sid, id, meta.title)
                     state.copy(
                         bindings = state.bindings + (sid to Binding(series, 1.0, "manual link", manual = true)),
                         rejected = state.rejected - sid,
@@ -871,7 +1045,7 @@ class Aggregator(
         // Links pre-made from search results are title-only. Verify them with provider details (year, authors,
         // tracker ids, alt titles) before trusting them, exactly like a normal match.
         // Gallery copies were grouped by exact title in search; galleries carry no ids or years to verify against.
-        val unverified = state.bindings.filter { (sid, b) -> b.unverified && registry[sid] != null && registry[sid]?.role != ProviderRole.GALLERY }
+        val unverified = state.bindings.filter { (sid, b) -> b.unverified && sid in enabled && registry[sid] != null && registry[sid]?.role != ProviderRole.GALLERY }
         val verified = coroutineScope {
             unverified.map { (sid, b) -> async { Triple(sid, b, cachedDetails(registry[sid]!!, b.series, settings)) } }.awaitAll()
         }
@@ -884,6 +1058,7 @@ class Aggregator(
             } else {
                 log("not linking $sid:${b.series.id} to ${key.value}: ${verdict.reasons.joinToString()}")
                 rememberRejection(key, detailed)
+                if (b.reason.startsWith(ALIAS_REASON)) dropAlias(b.reason.removePrefix(ALIAS_REASON), key.value)
                 state.copy(bindings = state.bindings - sid, rejected = state.rejected + (sid to b.series.id))
             }
         }
@@ -1007,40 +1182,94 @@ class Aggregator(
             score
         }
 
+    /** Linking searches: several title variants per provider, bounded concurrency, every provider awaited. */
     private suspend fun searchProviders(
         queries: List<String>,
         settings: AggregatorSettings,
         adapters: List<SourceAdapter> = registry.enabled(settings, includeUnhealthy = false),
-        deadlineMs: Long? = null,
         stopWhen: (List<SourceSeries>) -> Boolean = { false },
     ): Map<String, List<SourceSeries>> = coroutineScope {
-        // A user search asks every provider once, each a different host with its own rate limiter: no shared gate.
-        // Linking searches send several title variants per provider and stay bounded.
-        val gate = Semaphore(if (deadlineMs != null) adapters.size.coerceAtLeast(1) else settings.maxConcurrentSearches.coerceIn(1, 8))
-        adapters.map { a ->
-            async {
-                val collected = java.util.Collections.synchronizedList(mutableListOf<SourceSeries>())
-                var anySuccess = false
-                val work: suspend () -> Unit = {
-                    for (q in queries.filter { it.isNotBlank() }) {
-                        val r = gate.withPermit { cachedSearch(a, q, settings) } ?: continue
-                        anySuccess = true
-                        collected += r
-                        if (stopWhen(collected.toList()) || r.any { TitleNormalizer.compact(it.title) == TitleNormalizer.compact(q) }) break
-                    }
+        val gate = Semaphore(settings.maxConcurrentSearches.coerceIn(1, 8))
+        adapters.map { a -> async { providerSearch(a, queries, settings, gate, stopWhen)?.let { a.id to it } } }
+            .awaitAll().filterNotNull().toMap()
+    }
+
+    /** One provider asked [queries] in turn (stopping at an exact or confident answer); null when every request failed. */
+    private suspend fun providerSearch(
+        a: SourceAdapter,
+        queries: List<String>,
+        settings: AggregatorSettings,
+        gate: Semaphore?,
+        stopWhen: (List<SourceSeries>) -> Boolean = { false },
+    ): List<SourceSeries>? {
+        val collected = mutableListOf<SourceSeries>()
+        var anySuccess = false
+        for (q in queries.filter { it.isNotBlank() }) {
+            val r = (if (gate != null) gate.withPermit { cachedSearch(a, q, settings) } else cachedSearch(a, q, settings)) ?: continue
+            anySuccess = true
+            collected += r
+            if (stopWhen(collected.toList()) || r.any { TitleNormalizer.compact(it.title) == TitleNormalizer.compact(q) }) break
+        }
+        return if (anySuccess) collected.distinctBy { it.id } else null
+    }
+
+    /**
+     * A user search of [adapters] (each a different host with its own rate limiter: no shared gate). Results are
+     * collected as each provider answers. The page waits at most [deadlineMs]; once [enough] holds, the providers still
+     * running get [graceMs] more. A provider not waited for keeps running detached (its own timeout still applies):
+     * that warms its caches and health stats, and the next page or search includes its answer without asking again.
+     * Returns the hits (in [adapters] order) and the providers that finished, successfully or not.
+     */
+    private suspend fun gatherProviders(
+        queries: List<String>,
+        settings: AggregatorSettings,
+        adapters: List<SourceAdapter>,
+        deadlineMs: Long,
+        enough: ((Map<String, List<SourceSeries>>) -> Boolean)? = null,
+        graceMs: Long = SEARCH_GRACE_MS,
+    ): Pair<Map<String, List<SourceSeries>>, Set<String>> {
+        if (adapters.isEmpty()) return emptyMap<String, List<SourceSeries>>() to emptySet()
+        val done = Channel<Pair<String, List<SourceSeries>?>>(Channel.UNLIMITED)
+        adapters.forEach { a ->
+            // Detached, so a provider stuck in a blocking read cannot hold the results page past the deadline.
+            detached.launch {
+                var result: List<SourceSeries>? = null
+                try {
+                    result = providerSearch(a, queries, settings, gate = null)
+                } finally {
+                    done.trySend(a.id to result)
                 }
-                if (deadlineMs != null) {
-                    // Detached, so a provider stuck in a blocking read cannot hold the results page past the deadline.
-                    // A late provider is left to finish (its own timeout still applies): that warms its caches and
-                    // health stats, so the next search includes it.
-                    val job = detached.async { work() }
-                    withTimeoutOrNull(deadlineMs) { job.await() }
-                } else {
-                    work()
-                }
-                if (anySuccess) a.id to collected.toList().distinctBy { it.id } else null
             }
-        }.awaitAll().filterNotNull().toMap()
+        }
+        val hits = HashMap<String, List<SourceSeries>>()
+        val finished = HashSet<String>()
+        fun take(r: Pair<String, List<SourceSeries>?>) {
+            finished += r.first
+            r.second?.let { hits[r.first] = it }
+        }
+        withTimeoutOrNull(deadlineMs) {
+            while (finished.size < adapters.size && (enough == null || !enough(hits))) take(done.receive())
+            if (finished.size < adapters.size) withTimeoutOrNull(graceMs) { while (finished.size < adapters.size) take(done.receive()) }
+        }
+        while (true) take(done.tryReceive().getOrNull() ?: break) // answers that arrived as the wait ended
+        return adapters.mapNotNull { a -> hits[a.id]?.let { a.id to it } }.toMap() to finished.toSet()
+    }
+
+    /** Last measured duration (ms) of each phase: search, grouping, linking (detail verification), chapters, cover. */
+    private val phaseTimes = ConcurrentHashMap<String, Long>()
+
+    /** Durations of the most recent search/update phases, for diagnostics. */
+    fun lastTimings(): Map<String, Long> = phaseTimes.toMap()
+
+    private inline fun <T> timed(phase: String, block: () -> T): T {
+        val t0 = System.nanoTime()
+        try {
+            return block()
+        } finally {
+            val ms = (System.nanoTime() - t0) / 1_000_000
+            phaseTimes[phase] = ms
+            if (ms >= SLOW_PHASE_MS) log("timing $phase: $ms ms")
+        }
     }
 
     /** Scope for provider calls whose results are optional and must never delay the caller. */
@@ -1081,17 +1310,67 @@ class Aggregator(
 
     // ---------------------------------------------------------------- covers
 
-    private suspend fun resolveCover(key: SeriesKey, state: SeriesState, settings: AggregatorSettings): List<ScoredCover> {
-        // v3: entries cached by 1.6.x may hold MangaBaka/AniList artwork, which provider-only mode must not load.
-        val cacheKey = "cover:v3:${key.value}:${settings.highQualityCovers}:${settings.coverProvider}:${settings.preferOriginalArtwork}:${settings.externalMetadata}"
-        if (settings.cacheCovers) {
-            cache.get(cacheKey, ListSerializer(CoverCandidate.serializer()), 7 * CacheManager.DAY)?.let { cached ->
-                return cached.map { ScoredCover(it, 0.0, true, emptyList()) }
-            }
+    /** Owner of optional cover work that outlives the update which started it (bounded by [coverGate]). */
+    private val coverScope = CoroutineScope(SupervisorJob() + detachedDispatcher)
+    private val coverGate = Semaphore(COVER_JOBS)
+    private val coverFlights = ConcurrentHashMap<String, Deferred<List<ScoredCover>>>()
+
+    /** The cover comparison for [key], shared by concurrent updates; at most [COVER_JOB_MS] in all. */
+    private fun coverWork(key: SeriesKey, state: SeriesState, settings: AggregatorSettings): Deferred<List<ScoredCover>> {
+        val flight = key.value + "|" + coverCacheKey(key, settings)
+        coverFlights[flight]?.takeIf { it.isActive }?.let { return it }
+        val job = coverScope.async {
+            coverGate.withPermit { withTimeoutOrNull(COVER_JOB_MS) { timed("update.cover") { resolveCover(key, state, settings) } } }.orEmpty()
         }
+        coverFlights[flight] = job
+        job.invokeOnCompletion { coverFlights.remove(flight, job) }
+        return job
+    }
+
+    /** A cover known without any request: the last ranking, else the best cover chosen before, else a linked source's. */
+    private fun knownCover(key: SeriesKey, state: SeriesState, settings: AggregatorSettings): List<ScoredCover>? {
+        cachedCovers(key, settings)?.let { return it }
+        val enabled = enabledIds(settings)
+        val url = bestKnownCover(key.value, settings)?.takeIf { settings.externalMetadata || METADATA_PROVIDERS.none { m -> m in it } }
+            ?: orderedBindings(state).filter { it.series.sourceId in enabled && !it.unverified && registry[it.series.sourceId]?.standaloneResults != false }
+                .firstNotNullOfOrNull { it.series.coverUrl }
+            ?: return null
+        val owner = registry.imageOwner(url.substringAfter("://").substringBefore('/'))
+        return listOf(ScoredCover(CoverCandidate(url, owner?.id ?: "known", CoverOrigin.PROVIDER_THUMBNAIL.name, headers = owner?.imageHeaders(url).orEmpty()), 0.0, false, listOf("known cover")))
+    }
+
+    private fun enabledIds(settings: AggregatorSettings): Set<String> = registry.enabled(settings).map { it.id }.toSet()
+
+    /**
+     * Whether an image may be loaded under the current source policy: a provider's (named, or owning the URL's host)
+     * only while that provider is enabled; a metadata service's only while external metadata is on.
+     */
+    fun allowsImage(url: String, provider: String?, settings: AggregatorSettings): Boolean {
+        val enabled = enabledIds(settings)
+        val p = provider?.takeIf { it in METADATA_PROVIDERS || registry[it] != null }
+            ?: url.substringAfter("://", "").substringBefore('/').substringBefore(':').takeIf { it.isNotEmpty() }?.let { registry.imageOwner(it)?.id }
+            ?: return true
+        return if (p in METADATA_PROVIDERS) settings.externalMetadata else p in enabled
+    }
+
+    private fun coverCacheKey(key: SeriesKey, settings: AggregatorSettings) =
+        // v4: the enabled providers are part of the key (a cover cached while a provider was enabled is not reused
+        // once it is disabled); v3 entries may hold MangaBaka/AniList artwork, which provider-only mode must not load.
+        "cover:v4:${key.value}:${settings.highQualityCovers}:${settings.coverProvider}:${settings.preferOriginalArtwork}:${settings.externalMetadata}:" +
+            Integer.toHexString(enabledIds(settings).sorted().hashCode())
+
+    /** The cached cover ranking for [key], minus anything the current policy no longer allows. */
+    private fun cachedCovers(key: SeriesKey, settings: AggregatorSettings): List<ScoredCover>? {
+        if (!settings.cacheCovers) return null
+        val cached = cache.get(coverCacheKey(key, settings), ListSerializer(CoverCandidate.serializer()), 7 * CacheManager.DAY) ?: return null
+        return cached.filter { allowsImage(it.url, it.provider, settings) }.takeIf { it.isNotEmpty() }?.map { ScoredCover(it, 0.0, true, emptyList()) }
+    }
+
+    private suspend fun resolveCover(key: SeriesKey, state: SeriesState, settings: AggregatorSettings): List<ScoredCover> {
+        cachedCovers(key, settings)?.let { return it }
         // Artwork from a metadata service is only used (and probed) when the user enabled that service.
         val meta = state.metadata?.takeIf { settings.externalMetadata }
-        val enabled = registry.enabled(settings).map { it.id }.toSet()
+        val enabled = enabledIds(settings)
         val bound = state.bindings.filterKeys { it in enabled }.filterValues { !it.unverified }
         val candidates = mutableListOf<CoverCandidate>()
         if (settings.highQualityCovers) meta?.covers?.let { candidates += it }
@@ -1111,20 +1390,31 @@ class Aggregator(
         if (!settings.externalMetadata) candidates.removeAll { it.provider in METADATA_PROVIDERS }
         candidates.forEach { c -> if (registry[c.provider] != null) registry.noteImage(c.url, c.provider) }
         if (candidates.isEmpty()) meta?.covers?.let { candidates += it }
+        candidates.removeAll { !allowsImage(it.url, it.provider, settings) }
         val ranked = covers.rank(candidates, settings, meta?.originalLanguage ?: merged(state)?.metadata?.originalLanguage, primaryBinding(state, settings))
         if (settings.cacheCovers && ranked.isNotEmpty()) {
-            cache.put(cacheKey, ListSerializer(CoverCandidate.serializer()), ranked.take(4).map { it.candidate })
-            cache.put("cover:best:${key.value}", String.serializer(), ranked.first().candidate.url)
+            cache.put(coverCacheKey(key, settings), ListSerializer(CoverCandidate.serializer()), ranked.take(4).map { it.candidate })
+            cache.put("cover:best:${key.value}", String.serializer(), ranked.first().candidate.let { it.provider + BEST_SEP + it.url })
         }
         return ranked
     }
 
-    private fun primaryBinding(state: SeriesState, settings: AggregatorSettings): String? =
-        state.bindings.filterValues { !it.unverified }.keys.sortedBy { settings.sourceRank(it) }.firstOrNull()
+    private fun primaryBinding(state: SeriesState, settings: AggregatorSettings): String? {
+        val enabled = enabledIds(settings)
+        return state.bindings.filterValues { !it.unverified }.keys.filter { it in enabled }.sortedBy { settings.sourceRank(it) }.firstOrNull()
+    }
 
-    /** The cover chosen when the series was last opened (cached ranking), without any request. */
-    private fun bestKnownCover(key: String): String? =
-        cache.get("cover:best:$key", String.serializer(), 30 * CacheManager.DAY)
+    /**
+     * The cover chosen when the series was last opened (cached ranking), without any request; null when the current
+     * source policy no longer allows its provider. Stored as "provider<US>url" (1.6.9 and earlier: the URL alone,
+     * checked by the provider owning its host).
+     */
+    private fun bestKnownCover(key: String, settings: AggregatorSettings): String? {
+        val raw = cache.get("cover:best:$key", String.serializer(), 30 * CacheManager.DAY) ?: return null
+        val provider = raw.substringBefore(BEST_SEP, "").ifEmpty { null }
+        val url = raw.substringAfter(BEST_SEP)
+        return url.takeIf { allowsImage(it, provider, settings) }
+    }
 
     /** Browse-grid thumbnail: small pre-resized art; the full-quality cover is chosen when the series is opened. */
     private fun quickCover(m: SeriesMetadata, hits0: List<SourceSeries>, settings: AggregatorSettings): String? {
@@ -1161,7 +1451,7 @@ class Aggregator(
         val external = state.metadata?.takeIf { it.isExternal }
         val coverUrl = covers?.firstOrNull()?.let { best ->
             if (settings.coverFallback) {
-                FallbackInterceptor.tagCover(best.candidate.url, covers.drop(1).take(3).map { FallbackInterceptor.CoverAlt(it.candidate.url, it.candidate.headers) })
+                FallbackInterceptor.tagCover(best.candidate.url, covers.drop(1).take(3).map { FallbackInterceptor.CoverAlt(it.candidate.url, it.candidate.headers, it.candidate.provider) })
             } else {
                 best.candidate.url
             }
@@ -1272,12 +1562,94 @@ class Aggregator(
         return state.metadata?.takeIf { it.isExternal }?.displayTitle ?: merged(state)?.metadata?.title?.takeIf { it.isNotBlank() }
     }
 
-    /** Search results pre-link providers so opening a series is fast; never overrides an existing state. */
-    private fun rememberHints(key: SeriesKey, meta: SeriesMetadata?, bindings: Map<String, Binding>) {
+    /**
+     * Search results pre-link providers so opening a series is fast. Never overrides a saved state; a state made only
+     * of earlier hints (never opened) gains hints for providers it does not have yet, so a provider that answered
+     * later in the session joins the card the work is already shown as.
+     */
+    private fun rememberHints(key: SeriesKey, meta: SeriesMetadata?, bindings: Map<String, Binding>, intoSaved: Boolean = false) {
         if (bindings.isEmpty() && meta == null) return
         val existing = cache.get("state:${key.value}", SeriesState.serializer(), Long.MAX_VALUE)
-        if (existing != null) return
+        if (existing != null) {
+            // A saved state gains hints only from late answers of the search it was opened from ([intoSaved]); they
+            // are verified on its next refresh like any hint and never replace a link, spare or rejection.
+            val saved = existing.updatedAt != 0L
+            if (saved && !intoSaved) return
+            val add = bindings.filterKeys { it !in existing.bindings && it !in existing.rejected && it !in existing.spares }
+                .mapValues { it.value.copy(hint = true, confidence = minOf(it.value.confidence, 0.8)) }
+            if (add.isEmpty()) return
+            // Newer than the host's memo of the state it extends, so the next refresh reads it (see [loadState]).
+            cache.put("state:${key.value}", SeriesState.serializer(), existing.copy(bindings = existing.bindings + add, updatedAt = if (saved) existing.updatedAt + 1 else 0L), persist = saved)
+            return
+        }
         cache.put("state:${key.value}", SeriesState.serializer(), SeriesState(key.value, meta, bindings, updatedAt = 0), persist = false)
+    }
+
+    // ---------------------------------------------------------------- canonical identities
+
+    /**
+     * The identity shown for [key]: saved identities that strong evidence showed to be one work point to the one
+     * chosen for them ("canon:<alias>" -> key). Their own records are kept: old URLs, library entries and chapter
+     * links keep working under the alias.
+     */
+    private fun canonicalOf(key: String): String {
+        var k = key
+        repeat(4) { cache.get("canon:$k", String.serializer(), Long.MAX_VALUE)?.takeIf { it != k && it != key }?.let { k = it } ?: return k }
+        return k
+    }
+
+    private fun aliasesOf(key: String): List<String> = cache.get("aliases:$key", ListSerializer(String.serializer()), Long.MAX_VALUE).orEmpty()
+
+    private fun recordAliases(canonical: String, aliases: Set<String>) {
+        val known = aliasesOf(canonical)
+        val add = aliases.filter { it != canonical && it !in known }
+        if (add.isEmpty()) return
+        add.forEach { cache.put("canon:$it", String.serializer(), canonical) }
+        cache.put("aliases:$canonical", ListSerializer(String.serializer()), (known + add).takeLast(16))
+        log("search: ${add.joinToString()} shown as $canonical (same work)")
+    }
+
+    /** A rejected verification undoes the alias the merged evidence came from. */
+    private fun dropAlias(alias: String, canonical: String) {
+        if (cache.get("canon:$alias", String.serializer(), Long.MAX_VALUE) != canonical) return
+        cache.remove("canon:$alias")
+        cache.put("aliases:$canonical", ListSerializer(String.serializer()), aliasesOf(canonical) - alias)
+        log("$alias is no longer shown as $canonical: verification disagreed")
+    }
+
+    /**
+     * Which of several saved identities of one work is shown: one already shown for others, then a library entry,
+     * then one that was opened, then the fixed provider order. Deterministic, and remembered once chosen.
+     */
+    private fun chooseIdentity(keys: List<String>): String? {
+        val states = keys.associateWith { cache.get("state:$it", SeriesState.serializer(), Long.MAX_VALUE) }
+        fun priority(k: String) = (SeriesKey.parse(k) as? SeriesKey.Provider)?.let { p -> registry.all.indexOfFirst { it.id == p.sourceId }.let { if (it < 0) Int.MAX_VALUE else it } } ?: -1
+        return keys.distinct().sortedWith(
+            compareByDescending<String> { aliasesOf(it).isNotEmpty() }
+                .thenByDescending { (states[it]?.libraryAt ?: 0L) > 0L }
+                .thenByDescending { (states[it]?.updatedAt ?: 0L) > 0L }
+                .thenBy { priority(it) }
+                .thenBy { it },
+        ).firstOrNull()
+    }
+
+    /**
+     * Confirmed links of identities shown as [key] become hints of [key]: verified against its details like any
+     * search hint before they are trusted, never replacing a link [key] already has.
+     */
+    private fun absorbAliases(key: SeriesKey, state: SeriesState): SeriesState {
+        val aliases = aliasesOf(key.value).filter { canonicalOf(it) == key.value }
+        if (aliases.isEmpty()) return state
+        var s = state
+        for (alias in aliases) {
+            val other = cache.get("state:$alias", SeriesState.serializer(), Long.MAX_VALUE) ?: continue
+            val add = (other.bindings + other.spares).filter { (sid, b) ->
+                !b.unverified && sid !in s.bindings && sid !in s.spares && s.rejected[sid] != b.series.id && key.value !in rejectedBy(b.series)
+            }
+            if (add.isEmpty()) continue
+            s = s.copy(bindings = s.bindings + add.mapValues { (_, b) -> b.copy(hint = true, manual = false, confidence = minOf(b.confidence, 0.8), reason = "$ALIAS_REASON$alias") })
+        }
+        return s
     }
 
     fun forgetSeries(key: SeriesKey) {
@@ -1297,6 +1669,32 @@ class Aggregator(
 
     private companion object {
         const val SEARCH_DEADLINE_MS = 6_000L
+
+        /** How long the providers still running get once a confident match is in. */
+        const val SEARCH_GRACE_MS = 1_500L
+
+        /** Weight of a name that only refers to another work (a parody's original series) in search relevance. */
+        const val RELATED_WEIGHT = 0.7
+
+        /** Most an update waits for the optional cover comparison, and the most that comparison may take in all. */
+        const val COVER_WAIT_MS = 2_500L
+        const val COVER_JOB_MS = 20_000L
+
+        /** Background search completions at once, and how long opening a just-found result waits for its own. */
+        const val SESSION_JOBS = 4
+        const val SESSION_JOIN_MS = 4_000L
+
+        /** Cover comparisons running at once (they continue in the background after an update stopped waiting). */
+        const val COVER_JOBS = 2
+
+        /** Phases slower than this are logged. */
+        const val SLOW_PHASE_MS = 500L
+
+        /** Separates provider and URL in "cover:best:" entries. */
+        const val BEST_SEP = "\u001F"
+
+        /** Reason of a hint taken over from an identity shown as this one (see [absorbAliases]). */
+        const val ALIAS_REASON = "same work as "
 
         /** Deadline of the last-resort search of every remaining provider when a first page found nothing. */
         const val RESCUE_DEADLINE_MS = 15_000L
@@ -1370,3 +1768,23 @@ class Aggregator(
 
 /** A record from an external metadata service (fetched now, or stored by an earlier version). */
 val SeriesMetadata.isExternal: Boolean get() = provider == "mangabaka" || provider == "anilist"
+
+/** [CompositeIdentities] persisted in the engine's cache ("vid:<provider>:<base>" -> composite id). */
+private class CachedCompositeIdentities(private val cache: CacheManager) : CompositeIdentities {
+    private val memory = CompositeIdentities.InMemory()
+
+    override fun lookup(sourceId: String, bases: Set<String>): String? = CompositeIdentities.choose(
+        bases.mapNotNull { b -> memory.lookup(sourceId, setOf(b)) ?: cache.get(key(sourceId, b), String.serializer(), Long.MAX_VALUE) },
+    )
+
+    override fun record(sourceId: String, id: String, bases: Set<String>) {
+        bases.forEach { b ->
+            if (memory.lookup(sourceId, setOf(b)) == null && cache.get(key(sourceId, b), String.serializer(), Long.MAX_VALUE) == null) {
+                cache.put(key(sourceId, b), String.serializer(), id)
+            }
+        }
+        memory.record(sourceId, id, bases)
+    }
+
+    private fun key(sourceId: String, base: String) = "vid:$sourceId:" + base.take(120)
+}

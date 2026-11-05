@@ -88,6 +88,7 @@ class EHentaiAdapter(ctx: AdapterContext, override val baseUrl: String = "https:
             id = sid,
             title = Galleries.cleanTitle(raw),
             altTitles = Galleries.titles(raw).drop(1),
+            related = Galleries.references(listOf(raw)),
             coverUrl = img?.let { it.attr("abs:data-src").ifBlank { it.attr("abs:src") } }?.takeIf { it.startsWith("http") },
             kind = ContentKind.OTHER,
             status = PublicationStatus.COMPLETED,
@@ -114,6 +115,7 @@ class EHentaiAdapter(ctx: AdapterContext, override val baseUrl: String = "https:
         return series.copy(
             title = Galleries.cleanTitle(m.title),
             altTitles = Galleries.titles(m.title, m.title_jpn).drop(1),
+            related = Galleries.references(listOf(m.title, m.title_jpn), tags("parody")),
             coverUrl = m.thumb ?: series.coverUrl,
             authors = tags("artist") + tags("group"),
             genres = listOfNotNull(m.category) + m.tags.filter { it.substringBefore(':') in setOf("female", "male", "mixed", "other") },

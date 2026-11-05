@@ -5,6 +5,7 @@ import alexandria.core.cache.CacheManager
 import alexandria.core.cache.SingleFlight
 import alexandria.core.config.AggregatorSettings
 import alexandria.core.config.QualityMode
+import alexandria.core.config.SourcePolicy
 import alexandria.core.model.ReaderPage
 import alexandria.core.model.SourceChapter
 import alexandria.core.net.ProviderTimeoutException
@@ -79,10 +80,7 @@ class ReaderResolver(
     fun recentResolution(chapterRef: String): PageResolution? = recent[chapterRef]
 
     suspend fun resolve(chapterRef: String, releases: List<Release>, settings: AggregatorSettings): PageResolution {
-        val usable = releases.filter { r ->
-            !r.externalOnly && registry[r.sourceId] != null &&
-                (settings.enabledSources.isEmpty() || r.sourceId in settings.enabledSources)
-        }.distinctBy { it.sourceId to it.chapterId }
+        val usable = releases.filter { allowed(it, settings) }.distinctBy { it.sourceId to it.chapterId }
         if (usable.isEmpty()) throw NoReadableReleaseException(listOf("-" to "no enabled source carries this chapter"))
         var ordered = ranker.rank(usable, settings)
         val notes = mutableListOf<String>()
@@ -184,8 +182,16 @@ class ReaderResolver(
         evidence
     }
 
-    /** Page list of another release for page-level fallback (cached per chapter). */
+    /** Whether [r] may be read under [settings] now (its provider exists and is enabled; 18+ switch included). */
+    fun allowed(r: Release, settings: AggregatorSettings): Boolean =
+        !r.externalOnly && registry[r.sourceId] != null && SourcePolicy.allows(settings, r.sourceId)
+
+    /**
+     * Page list of another release for page-level fallback (cached per chapter). The current source policy is checked
+     * first, before the cached list too: a resolution prepared before a provider was disabled must not reach it.
+     */
     suspend fun alternatePages(chapterRef: String, release: Release, settings: AggregatorSettings): List<ReaderPage>? {
+        if (!allowed(release, settings)) return null
         alternatePages[altKey(chapterRef, release)]?.let { return it }
         return (tryPages(release, settings) as? Fetched.Ok)?.pages?.also { alternatePages[altKey(chapterRef, release)] = it }
     }
@@ -194,6 +200,7 @@ class ReaderResolver(
     suspend fun image(sourceId: String, page: ReaderPage, settings: AggregatorSettings): ReaderPage {
         if (!page.lazy) return page
         val adapter = registry[sourceId] ?: error("unknown source $sourceId")
+        check(SourcePolicy.allows(settings, sourceId)) { "$sourceId is disabled" }
         return registry.health.call(sourceId, settings.requestTimeoutSeconds * 1000L) { adapter.resolveImage(page.imageUrl) }
     }
 

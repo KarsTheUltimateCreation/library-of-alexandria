@@ -208,6 +208,7 @@ class HitomiAdapter(private val ctx: AdapterContext, override val baseUrl: Strin
             id = id,
             title = Galleries.cleanTitle(title),
             altTitles = Galleries.titles(title, japanese_title).drop(1),
+            related = Galleries.references(listOf(title, japanese_title), parodys?.map { it.parody }.orEmpty()),
             coverUrl = files.firstOrNull()?.let { runCatching { thumbnail(it.hash) }.getOrNull() },
             authors = artists.orEmpty().map { it.artist } + groups.orEmpty().map { it.group },
             genres = listOfNotNull(type) + tagNames,

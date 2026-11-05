@@ -22,8 +22,10 @@ import java.util.Collections
  * present. An unnumbered entry whose title is a base joins as part 1. Entries with the same number (a decensored
  * re-upload) become two releases of that part.
  *
- * The series id is `vol~<base words>`: stable whatever parts exist, and enough to find the parts again with a search
- * of the base title (new parts are picked up that way on refresh).
+ * The series id is `vol~<base words>`, enough to find the parts again with a search of the base title (new parts are
+ * picked up that way on refresh). Which base names a group can change as parts appear ("Bright Dawn 1–2" with
+ * "Akatsuki" aliases, then "Akatsuki 3"), so [CompositeIdentities] remembers every base a composite id was seen with:
+ * a later group sharing one of those bases keeps the id it was first given (library entries stay attached).
  */
 object VolumeSeries {
     const val PREFIX = "vol~"
@@ -65,7 +67,12 @@ object VolumeSeries {
      * Folds the numbered parts in [hits] into composite entries (in the position of their first part); other hits are
      * returned unchanged. Only hits accepted by [eligible] are considered.
      */
-    fun group(hits: List<SourceSeries>, eligible: (SourceSeries) -> Boolean): Pair<List<SourceSeries>, List<Group>> {
+    fun group(
+        hits: List<SourceSeries>,
+        /** The id a group with these bases was given before, if any. */
+        existing: (Set<String>) -> String? = { null },
+        eligible: (SourceSeries) -> Boolean,
+    ): Pair<List<SourceSeries>, List<Group>> {
         class Info(val s: SourceSeries, val number: Int?, val bases: Map<String, String>, val bare: Set<String>)
         val infos = hits.filter(eligible).map { s ->
             val ts = titles(s)
@@ -98,8 +105,8 @@ object VolumeSeries {
             val support = display0.keys.associateWith { k -> members.count { k in it.bases } + bareParts.count { k in it.bare } }
             val idBase = support.entries.filter { slug(display0.getValue(it.key)).replace("-", "").length >= 4 }
                 .maxByOrNull { it.value }?.let { display0.getValue(it.key) } ?: continue
-            val id = PREFIX + slug(idBase)
-            if (id.length > 200) continue
+            val id = existing(baseKeys)?.takeIf { isComposite(it) && groups.none { g -> g.series.id == it } } ?: (PREFIX + slug(idBase))
+            if (id.length > 200 || groups.any { it.series.id == id }) continue
             val sorted = parts.sortedBy { it.second }
             val first = sorted.first().first
             // Display title: the base of the first part's own title ("[H] Imouto Wa Mesu Orc 2" -> "Imouto Wa Mesu Orc").
@@ -115,6 +122,7 @@ object VolumeSeries {
                 coverUrl = sorted.firstNotNullOfOrNull { it.first.coverUrl },
                 authors = parts.flatMap { it.first.authors }.distinct(),
                 genres = parts.flatMap { it.first.genres }.distinct(),
+                related = parts.flatMap { it.first.related }.distinctBy { it.lowercase() }.take(12),
                 year = parts.mapNotNull { it.first.year }.minOrNull(),
                 description = null,
                 webUrl = first.webUrl,
@@ -154,6 +162,15 @@ class VolumeGroupingAdapter(
     private val eligible: (SourceSeries) -> Boolean = { true },
 ) : SourceAdapter by inner {
 
+    /** Composite ids given so far, by base; the engine replaces it with a persisted one. */
+    @Volatile var identities: CompositeIdentities = CompositeIdentities.InMemory()
+
+    private fun groupHits(hits: List<SourceSeries>): Pair<List<SourceSeries>, List<VolumeSeries.Group>> {
+        val result = VolumeSeries.group(hits, existing = { bases -> identities.lookup(id, bases) }, eligible = eligible)
+        result.second.forEach { g -> identities.record(id, g.series.id, g.bases) }
+        return result
+    }
+
     /** Parts of composites seen recently (search results), so opening one needs no second search. */
     private val known: MutableMap<String, List<Pair<SourceSeries, Int>>> = Collections.synchronizedMap(
         object : LinkedHashMap<String, List<Pair<SourceSeries, Int>>>(64, 0.75f, true) {
@@ -162,7 +179,7 @@ class VolumeGroupingAdapter(
     )
 
     private fun fold(hits: List<SourceSeries>): List<SourceSeries> {
-        val (out, groups) = VolumeSeries.group(hits, eligible)
+        val (out, groups) = groupHits(hits)
         groups.forEach { g -> known[g.series.id] = merge(known[g.series.id], g.parts) }
         return out
     }
@@ -181,7 +198,7 @@ class VolumeGroupingAdapter(
         val found = try {
             // By base title, not by id: the parts found now may name the group differently than when it was first seen.
             val base = TitleNormalizer.compact(VolumeSeries.query(id))
-            VolumeSeries.group(inner.search(VolumeSeries.query(id)), eligible).second
+            groupHits(inner.search(VolumeSeries.query(id))).second
                 .sortedByDescending { it.series.id == id }.firstOrNull { it.series.id == id || base in it.bases }
         } catch (e: CancellationException) {
             throw e
@@ -231,5 +248,34 @@ class VolumeGroupingAdapter(
     override fun seriesWebUrl(seriesId: String): String {
         if (!VolumeSeries.isComposite(seriesId)) return inner.seriesWebUrl(seriesId)
         return known[seriesId]?.firstOrNull()?.first?.let { it.webUrl ?: inner.seriesWebUrl(it.id) } ?: inner.baseUrl
+    }
+}
+
+/**
+ * Composite ids by provider and title base ([VolumeSeries.Group.bases]). A base keeps the first id recorded for it;
+ * lookups pick the id most of a group's bases point to (ties: the earliest-sorting id), so the choice is stable.
+ */
+interface CompositeIdentities {
+    fun lookup(sourceId: String, bases: Set<String>): String?
+    fun record(sourceId: String, id: String, bases: Set<String>)
+
+    /** Bounded in-memory map (tests, and until the engine attaches a persisted one). */
+    class InMemory(private val capacity: Int = 2000) : CompositeIdentities {
+        private val map = Collections.synchronizedMap(
+            object : LinkedHashMap<String, String>(64, 0.75f, true) {
+                override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?) = size > capacity
+            },
+        )
+
+        override fun lookup(sourceId: String, bases: Set<String>): String? = choose(bases.mapNotNull { map["$sourceId:$it"] })
+
+        override fun record(sourceId: String, id: String, bases: Set<String>) {
+            bases.forEach { b -> map.putIfAbsent("$sourceId:$b", id) }
+        }
+    }
+
+    companion object {
+        fun choose(ids: List<String>): String? =
+            ids.groupingBy { it }.eachCount().entries.sortedWith(compareByDescending<Map.Entry<String, Int>> { it.value }.thenBy { it.key }).firstOrNull()?.key
     }
 }
